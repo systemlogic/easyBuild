@@ -26,6 +26,12 @@ sample program lives in its own `example/<language>/` package, so
 Supported target platforms (native builds, one platform per Bazel invocation):
     linux_x86_64    linux_aarch64
     macos_x86_64    macos_aarch64
+
+Hermetic linting: cpp, java, python, rust, and kotlin each get a lint aspect
+(clang-tidy, checkstyle, ruff, clippy, ktlint respectively) wired into
+tools/lint/linters.bzl, runnable via `bazel build --config=lint //example/...`.
+go gets nogo static analysis instead, which runs on every normal compile.
+scala and haskell have no hermetic Bazel-native linter wired in yet.
 """
 import argparse
 import json
@@ -65,7 +71,31 @@ DEFAULT_SCALA_VERSION = "3.8.4"  # a Scala 3 release listed in rules_scala's own
 DEFAULT_GHC_VERSION = "9.6.5"  # a widely-used stable GHC release available as a
                                # prebuilt bindist for all four platforms below.
 
+ASPECT_RULES_LINT_VERSION = "2.7.2"  # latest aspect_rules_lint release on BCR;
+                                     # provides the clang-tidy/checkstyle/ruff/
+                                     # ktlint lint aspects and prebuilt tool
+                                     # downloads used below.
+ASPECT_RULES_LINT_RUST_VERSION = "0.0.2"  # the clippy aspect ships in this
+                                          # separate module, not aspect_rules_lint
+                                          # itself.
+BAZEL_SKYLIB_VERSION = "1.8.2"  # needed for native_binary(), used to expose
+                                # clang-tidy out of the LLVM toolchain download.
+
 SUPPORTED_LANGUAGES = ["cpp", "java", "python", "go", "rust", "kotlin", "scala", "haskell"]
+
+# Languages with a hermetic Bazel lint aspect wired into tools/lint/linters.bzl
+# below, keyed by the aspect name registered there (used in .bazelrc's
+# `build:lint --aspects=//tools/lint:linters.bzl%<name>` lines). go's `nogo`
+# runs at normal compile time instead of through an aspect (see
+# module_bazel_go_block); scala and haskell have no hermetic Bazel-native
+# linter available upstream yet -- see their example READMEs.
+LINT_ASPECT_NAMES = {
+    "cpp": "clang_tidy",
+    "java": "checkstyle",
+    "python": "ruff",
+    "rust": "clippy",
+    "kotlin": "ktlint",
+}
 
 SUPPORTED_PLATFORMS = {
     "linux_x86_64": ("@platforms//os:linux", "@platforms//cpu:x86_64"),
@@ -148,7 +178,10 @@ llvm.toolchain(
     name = "llvm_toolchain",
     llvm_version = "{llvm_version}",
 )
-use_repo(llvm, "llvm_toolchain")
+# "llvm_toolchain_llvm" (the actual downloaded distribution, as opposed to
+# "llvm_toolchain" which is the cc_toolchain registration repo) is exposed so
+# tools/lint/BUILD.bazel can wrap its bundled clang-tidy as a lint aspect.
+use_repo(llvm, "llvm_toolchain", "llvm_toolchain_llvm")
 
 register_toolchains(
     "@llvm_toolchain//:all",
@@ -210,6 +243,12 @@ def module_bazel_go_block(go_version: str) -> str:
 go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
 go_sdk.download(version = "{go_version}")
 use_repo(go_sdk, "go_toolchains")
+
+# Hermetic build-time linting: nogo runs the full golang.org/x/tools analyzer
+# suite (TOOLS_NOGO, wired up in tools/lint/BUILD.bazel) as a validation
+# action alongside every go compile -- unlike the other languages, no separate
+# `--config=lint` invocation is needed to see its findings.
+go_sdk.nogo(nogo = "//tools/lint:nogo")
 
 register_toolchains(
     "@go_toolchains//:all",
@@ -322,6 +361,36 @@ MODULE_BAZEL_BLOCK_BUILDERS = {
 }
 
 
+def lint_tools_extension_block(languages: dict) -> str:
+    # java's checkstyle and kotlin's ktlint both fetch their prebuilt tool via
+    # the same shared aspect_rules_lint "tools" module extension, so (unlike
+    # the per-language MODULE_BAZEL_BLOCK_BUILDERS above) this one extension
+    # use/use_repo pair is composed centrally across both languages rather
+    # than duplicated per language block.
+    calls, repos = [], []
+    if "java" in languages:
+        calls.append("lint_tools.checkstyle()")
+        repos.append("com_puppycrawl_tools_checkstyle")
+    if "kotlin" in languages:
+        calls.append("lint_tools.ktlint()")
+        repos.append("com_github_pinterest_ktlint")
+    if not calls:
+        return ""
+    repo_lines = ",\n    ".join(f'"{r}"' for r in repos)
+    return f"""\
+# === EASY_BUILD:BEGIN LINT_TOOLS ===
+# Shared aspect_rules_lint prebuilt tool downloads for the per-language lint
+# aspects registered in tools/lint/linters.bzl.
+lint_tools = use_extension("@aspect_rules_lint//lint:extensions.bzl", "tools")
+{chr(10).join(calls)}
+use_repo(
+    lint_tools,
+    {repo_lines},
+)
+# === EASY_BUILD:END LINT_TOOLS ===
+"""
+
+
 def render_module_bazel(config: dict) -> str:
     languages = config["languages"]
     lines = [
@@ -332,6 +401,12 @@ def render_module_bazel(config: dict) -> str:
         "",
         'bazel_dep(name = "platforms", version = "1.1.0")',
     ]
+    if any(lang in languages for lang in LINT_ASPECT_NAMES):
+        lines.append(f'bazel_dep(name = "aspect_rules_lint", version = "{ASPECT_RULES_LINT_VERSION}")')
+    if "rust" in languages:
+        lines.append(f'bazel_dep(name = "aspect_rules_lint_rust", version = "{ASPECT_RULES_LINT_RUST_VERSION}")')
+    if "cpp" in languages:
+        lines.append(f'bazel_dep(name = "bazel_skylib", version = "{BAZEL_SKYLIB_VERSION}")')
     for lang in SUPPORTED_LANGUAGES:
         if lang in languages:
             for dep_name, dep_version in LANGUAGE_BAZEL_DEPS[lang]:
@@ -341,7 +416,11 @@ def render_module_bazel(config: dict) -> str:
         for lang in SUPPORTED_LANGUAGES
         if lang in languages
     ]
-    return "\n".join(lines) + "\n\n" + "\n".join(blocks)
+    result = "\n".join(lines) + "\n\n" + "\n".join(blocks)
+    lint_tools = lint_tools_extension_block(languages)
+    if lint_tools:
+        result += "\n" + lint_tools
+    return result
 
 
 def bazelrc_cpp_block() -> str:
@@ -441,6 +520,26 @@ BAZELRC_BLOCK_BUILDERS = {
 }
 
 
+def bazelrc_lint_block(languages: dict) -> str:
+    aspect_langs = [lang for lang in SUPPORTED_LANGUAGES if lang in languages and lang in LINT_ASPECT_NAMES]
+    if not aspect_langs:
+        return ""
+    lines = [
+        "# === EASY_BUILD:BEGIN LINT ===",
+        "# `bazel build --config=lint //example/...` runs each configured language's",
+        "# hermetic lint aspect (see tools/lint/linters.bzl) and fails the build on any",
+        "# violation. go's nogo static analysis instead runs on every normal build --",
+        "# see the EASY_BUILD:BEGIN/END GO block above.",
+    ]
+    for lang in aspect_langs:
+        lines.append(f"build:lint --aspects=//tools/lint:linters.bzl%{LINT_ASPECT_NAMES[lang]}")
+    lines.append("build:lint --@aspect_rules_lint//lint:fail_on_violation")
+    lines.append("build:lint --output_groups=+lint")
+    lines.append("build:lint --keep_going")
+    lines.append("# === EASY_BUILD:END LINT ===")
+    return "\n".join(lines) + "\n"
+
+
 def render_bazelrc(config: dict, default_platform: str) -> str:
     languages = config["languages"]
     lines = [
@@ -455,7 +554,11 @@ def render_bazelrc(config: dict, default_platform: str) -> str:
         for lang in SUPPORTED_LANGUAGES
         if lang in languages
     ]
-    return "\n".join(lines) + "\n" + "\n".join(blocks)
+    result = "\n".join(lines) + "\n" + "\n".join(blocks)
+    lint_block = bazelrc_lint_block(languages)
+    if lint_block:
+        result += "\n" + lint_block
+    return result
 
 
 def render_root_readme(config: dict, default_platform: str) -> str:
@@ -486,11 +589,34 @@ def render_root_readme(config: dict, default_platform: str) -> str:
     lines.append("")
     lines.append(f"Default target platform for this host: `{default_platform}`")
     lines.append("")
+    lint_langs = [lang for lang in configured if lang in LINT_ASPECT_NAMES]
+    if lint_langs or "go" in configured:
+        lines.append("## Linting")
+        lines.append("")
+        if lint_langs:
+            lines.append("`bazel build --config=lint //example/...` runs each configured language's")
+            lines.append("hermetic lint aspect and fails on any violation:")
+            lines.append("")
+            for lang in lint_langs:
+                lines.append(f"- **{lang}** -- `{LINT_ASPECT_NAMES[lang]}`")
+        if "go" in configured:
+            lines.append("- **go** -- `nogo` (runs on every normal `bazel build`/`bazel test`, not")
+            lines.append("  through `--config=lint`)")
+        unsupported = [lang for lang in configured if lang not in LINT_ASPECT_NAMES and lang != "go"]
+        if unsupported:
+            lines.append("")
+            lines.append(
+                f"_(no hermetic Bazel-native linter wired in yet for: {', '.join(unsupported)})_"
+            )
+        lines.append("")
     lines.append("## Files")
     lines.append("")
     lines.append("- `MODULE.bazel` / `.bazelrc` -- shared toolchain registration and")
     lines.append("  flags, one marked block per configured language.")
     lines.append("- `platforms/BUILD.bazel` -- the four target `platform()` definitions.")
+    if lint_langs:
+        lines.append("- `tools/lint/` -- lint aspect definitions (`linters.bzl`) and any custom")
+        lines.append("  linter binary wiring (`BUILD.bazel`), composed across configured languages.")
     lines.append("- `example/<language>/` -- that language's sample program, `BUILD.bazel`,")
     lines.append("  and its own `README.md` with language-specific usage/verification steps.")
     lines.append("")
@@ -615,6 +741,16 @@ from an aarch64 macOS host above.
 OS/arch** (e.g. one CI runner per platform). Use the verification command
 above whenever you're unsure.
 
+## Linting
+
+```sh
+bazel build --config={default_platform} --config=lint //example/cpp:hello
+```
+
+Runs clang-tidy (downloaded as part of the same LLVM distribution above, via
+`tools/lint/linters.bzl`) and fails the build on any violation. Rules live in
+the workspace root `.clang-tidy`.
+
 ## Files
 
 - `//MODULE.bazel` (workspace root) -- declares the hermetic `toolchains_llvm`
@@ -712,6 +848,16 @@ by `JAVA_HOME`, host tooling is being used -- stop and investigate before
 trusting the build (most likely `--java_runtime_version` was overridden back
 to `local_jdk` on the command line or in a `.bazelrc`
 further down the include chain).
+
+## Linting
+
+```sh
+bazel build --config={default_platform} --config=lint //example/java:hello
+```
+
+Runs checkstyle (downloaded hermetically via `tools/lint/linters.bzl`) and
+fails the build on any violation. Rules live in the workspace root
+`checkstyle.xml`.
 
 ## Files
 
@@ -893,6 +1039,16 @@ on your actual target OS/arch before depending on this in production, and be
 ready to bump the `rules_python` version pinned in `MODULE.bazel` if you hit
 one.
 
+## Linting
+
+```sh
+bazel build --config={default_platform} --config=lint //example/python:hello_lib
+```
+
+Runs ruff (a prebuilt binary from `aspect_rules_lint`, via
+`tools/lint/linters.bzl`) and fails the build on any violation. Rules live in
+the workspace root `.ruff.toml`.
+
 ## Files
 
 - `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_python`
@@ -999,6 +1155,19 @@ placeholder so the real build-sandbox path never leaks into the binary); the
 variable either -- if it ever printed a real filesystem path instead, some
 host environment leaked into the build or run.
 
+## Linting
+
+Unlike the other languages here, Go linting isn't a separate `--config=lint`
+step: `nogo` (the full `golang.org/x/tools` analyzer suite, wired up in
+`tools/lint/BUILD.bazel` and registered via `go_sdk.nogo` in `MODULE.bazel`)
+runs as a build-time validation action on every normal compile, so a plain
+
+```sh
+bazel build --config={default_platform} //example/go:hello
+```
+
+already surfaces any findings as compile errors.
+
 ## Files
 
 - `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_go`
@@ -1081,6 +1250,17 @@ The `rustc` path must be under `external/rules_rust++rust+rust_.../bin/rustc`
 -- never `~/.cargo/bin/rustc`, `/usr/bin/rustc`, or a `rustup` shim. If it
 ever points there, host tooling is being used -- stop and investigate before
 trusting the build.
+
+## Linting
+
+```sh
+bazel build --config={default_platform} --config=lint //example/rust:hello
+```
+
+Runs clippy (via the same hermetic Rust toolchain above, driven by the
+`aspect_rules_lint_rust` module's clippy aspect in `tools/lint/linters.bzl`)
+and fails the build on any violation. Rules live in the workspace root
+`.clippy.toml`.
 
 ## Files
 
@@ -1165,6 +1345,16 @@ bazel run --config={default_platform} //example/kotlin:hello   # check the print
 The compiler path must be under `external/rules_kotlin++...`, and `java.home`
 must be under `external/rules_java++toolchains+remotejdk_{jdk_version}*/...` --
 never a system `kotlinc` install or `/Library/Java/...` / `/usr/lib/jvm/...`.
+
+## Linting
+
+```sh
+bazel build --config={default_platform} --config=lint //example/kotlin:hello
+```
+
+Runs ktlint (downloaded hermetically via `tools/lint/linters.bzl`) and fails
+the build on any violation. Style rules follow the workspace root
+`.editorconfig`.
 
 ## Files
 
@@ -1252,6 +1442,17 @@ bazel run --config={default_platform} //example/scala:hello   # check the printe
 The compiler path must be under `external/rules_scala++...`, and `java.home`
 must be under `external/rules_java++toolchains+remotejdk_{jdk_version}*/...` --
 never a system `scalac` install or `/Library/Java/...` / `/usr/lib/jvm/...`.
+
+## Linting
+
+**No hermetic Bazel-native linter is wired in for Scala yet.** `aspect_rules_lint`
+does ship a `scalafix` aspect (`aspect_rules_lint_scala`), but its example setup
+resolves scalafix and its dependencies through `rules_jvm_external`'s
+`maven.install`, which needs a real, hash-pinned lock file generated by running
+`bazel run @unpinned_maven_scalafix//:pin` against a live Maven Central fetch --
+not something this scaffold can safely commit without that step. See
+`aspect-build/rules_lint`'s `examples/scala` for the reference setup if you want
+to wire it in by hand.
 
 ## Files
 
@@ -1345,6 +1546,14 @@ command above on your actual target OS/arch before depending on this in
 production, and be ready to adjust the pinned GHC version if a bindist isn't
 published for your platform.
 
+## Linting
+
+**No hermetic Bazel-native linter is wired in for Haskell yet.** `hlint` is the
+standard tool, but no Bazel ruleset downloads and wires it up as a lint aspect
+the way `aspect_rules_lint` does for the other languages here; running it
+would mean invoking a host-installed `hlint`, which breaks this scaffold's
+no-host-tool guarantee.
+
 ## Files
 
 - `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_haskell`
@@ -1357,6 +1566,187 @@ published for your platform.
   (with `base` imported via `haskell_toolchain_library`) that prints its OS,
   arch, and compiler version.
 """
+
+
+# ============================================================================
+# lint: hermetic static analysis (tools/lint/*), composed across configured
+# languages the same way MODULE.bazel/.bazelrc are -- see LINT_ASPECT_NAMES.
+# ============================================================================
+
+def clang_tidy_config() -> str:
+    return """\
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  readability-*
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*'
+"""
+
+
+def checkstyle_config() -> str:
+    return """\
+<?xml version="1.0"?>
+<!DOCTYPE module PUBLIC
+    "-//Checkstyle//DTD Checkstyle Configuration 1.3//EN"
+    "https://checkstyle.org/dtds/configuration_1_3.dtd">
+<module name="Checker">
+    <module name="TreeWalker">
+        <module name="UnusedImports"/>
+        <module name="EqualsHashCode"/>
+    </module>
+</module>
+"""
+
+
+def ruff_config() -> str:
+    return """\
+line-length = 100
+
+[lint]
+select = ["E", "F", "I"]
+"""
+
+
+def clippy_config() -> str:
+    return """\
+# clippy lint configuration -- see
+# https://doc.rust-lang.org/clippy/configuration.html
+"""
+
+
+def editorconfig_config() -> str:
+    return """\
+root = true
+
+[*.{kt,kts}]
+indent_size = 4
+insert_final_newline = true
+"""
+
+
+# Each entry returns (load_line, body) for tools/lint/BUILD.bazel.
+LINT_BUILD_BLOCK_BUILDERS = {
+    "cpp": lambda: (
+        'load("@bazel_skylib//rules:native_binary.bzl", "native_binary")',
+        """\
+# Wraps the clang-tidy binary bundled inside the already-downloaded LLVM
+# distribution (see MODULE.bazel's EASY_BUILD:BEGIN/END CPP block) so the
+# clang_tidy lint aspect below can run it -- no separate download needed.
+native_binary(
+    name = "clang_tidy",
+    src = "@llvm_toolchain_llvm//:bin/clang-tidy",
+    out = "clang_tidy",
+    visibility = ["//visibility:public"],
+)
+""",
+    ),
+    "java": lambda: (
+        'load("@rules_java//java:defs.bzl", "java_binary")',
+        """\
+java_binary(
+    name = "checkstyle",
+    main_class = "com.puppycrawl.tools.checkstyle.Main",
+    runtime_deps = ["@com_puppycrawl_tools_checkstyle//jar"],
+    visibility = ["//visibility:public"],
+)
+""",
+    ),
+    "go": lambda: (
+        'load("@rules_go//go:def.bzl", "nogo", "TOOLS_NOGO")',
+        """\
+# Runs the full golang.org/x/tools analyzer suite as a build-time validation
+# action on every go compile (registered via go_sdk.nogo in MODULE.bazel's
+# EASY_BUILD:BEGIN/END GO block) -- not an aspect, so it isn't listed in
+# LINT_ASPECT_NAMES / .bazelrc's `build:lint` config.
+nogo(
+    name = "nogo",
+    deps = TOOLS_NOGO,
+    visibility = ["//visibility:public"],
+)
+""",
+    ),
+}
+
+
+def render_lint_build_bazel(languages: dict):
+    langs = [lang for lang in SUPPORTED_LANGUAGES if lang in languages and lang in LINT_BUILD_BLOCK_BUILDERS]
+    if not langs:
+        return None
+    loads, bodies = [], []
+    for lang in langs:
+        load_line, body = LINT_BUILD_BLOCK_BUILDERS[lang]()
+        loads.append(load_line)
+        bodies.append(body)
+    return "\n".join(loads) + "\n\n" + "\n".join(bodies)
+
+
+# Each entry returns (load_line, aspect_definition) for tools/lint/linters.bzl.
+LINT_LINTERS_BZL_BUILDERS = {
+    "cpp": lambda: (
+        'load("@aspect_rules_lint//lint:clang_tidy.bzl", "lint_clang_tidy_aspect")',
+        """\
+clang_tidy = lint_clang_tidy_aspect(
+    binary = Label("//tools/lint:clang_tidy"),
+    global_config = Label("//:.clang-tidy"),
+    lint_target_headers = True,
+)
+""",
+    ),
+    "java": lambda: (
+        'load("@aspect_rules_lint//lint:checkstyle.bzl", "lint_checkstyle_aspect")',
+        """\
+checkstyle = lint_checkstyle_aspect(
+    binary = Label("//tools/lint:checkstyle"),
+    config = Label("//:checkstyle.xml"),
+)
+""",
+    ),
+    "python": lambda: (
+        'load("@aspect_rules_lint//lint:ruff.bzl", "lint_ruff_aspect")',
+        """\
+ruff = lint_ruff_aspect(
+    binary = Label("@aspect_rules_lint//lint:ruff_bin"),
+    configs = [Label("//:.ruff.toml")],
+)
+""",
+    ),
+    "rust": lambda: (
+        'load("@aspect_rules_lint_rust//:clippy.bzl", "lint_clippy_aspect")',
+        """\
+clippy = lint_clippy_aspect(
+    config = Label("//:.clippy.toml"),
+)
+""",
+    ),
+    "kotlin": lambda: (
+        'load("@aspect_rules_lint//lint:ktlint.bzl", "lint_ktlint_aspect")',
+        """\
+ktlint = lint_ktlint_aspect(
+    binary = Label("@com_github_pinterest_ktlint//file"),
+    editorconfig = Label("//:.editorconfig"),
+)
+""",
+    ),
+}
+
+
+def render_lint_linters_bzl(languages: dict):
+    langs = [lang for lang in SUPPORTED_LANGUAGES if lang in languages and lang in LINT_LINTERS_BZL_BUILDERS]
+    if not langs:
+        return None
+    loads, defs = [], []
+    for lang in langs:
+        load_line, definition = LINT_LINTERS_BZL_BUILDERS[lang]()
+        loads.append(load_line)
+        defs.append(definition)
+    header = (
+        '"""Hermetic lint aspects, composed from every language configured via `easy_build init`.\n\n'
+        'Regenerated in full on every `init` -- add custom rules in a separate .bzl\n'
+        'file instead of hand-editing the load()s/aspects below."""\n'
+    )
+    return header + "\n" + "\n".join(loads) + "\n\n" + "\n".join(defs)
 
 
 def cmd_init(args: argparse.Namespace) -> None:
@@ -1378,6 +1768,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         if not (example_dir / "hello.cpp").exists() or args.force:
             write_file(example_dir / "hello.cpp", hello_cpp(), args.force)
         write_file(example_dir / "README.md", readme_cpp(llvm_version, default_platform), args.force)
+        if not (out_dir / ".clang-tidy").exists() or args.force:
+            write_file(out_dir / ".clang-tidy", clang_tidy_config(), args.force)
         config["languages"]["cpp"] = {
             "version": llvm_version,
             "platform": default_platform,
@@ -1392,6 +1784,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         if not (example_dir / "Hello.java").exists() or args.force:
             write_file(example_dir / "Hello.java", hello_java(), args.force)
         write_file(example_dir / "README.md", readme_java(default_platform, java_version), args.force)
+        if not (out_dir / "checkstyle.xml").exists() or args.force:
+            write_file(out_dir / "checkstyle.xml", checkstyle_config(), args.force)
         config["languages"]["java"] = {
             "version": java_version,
             "platform": default_platform,
@@ -1410,6 +1804,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         if not (example_dir / "requirements_lock.txt").exists() or args.force:
             write_file(example_dir / "requirements_lock.txt", requirements_lock(), args.force)
         write_file(example_dir / "README.md", readme_python(default_platform, python_version), args.force)
+        if not (out_dir / ".ruff.toml").exists() or args.force:
+            write_file(out_dir / ".ruff.toml", ruff_config(), args.force)
         config["languages"]["python"] = {
             "version": python_version,
             "platform": default_platform,
@@ -1438,6 +1834,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         if not (example_dir / "main.rs").exists() or args.force:
             write_file(example_dir / "main.rs", hello_rust(), args.force)
         write_file(example_dir / "README.md", readme_rust(rust_version, default_platform), args.force)
+        if not (out_dir / ".clippy.toml").exists() or args.force:
+            write_file(out_dir / ".clippy.toml", clippy_config(), args.force)
         config["languages"]["rust"] = {
             "version": rust_version,
             "platform": default_platform,
@@ -1455,6 +1853,8 @@ def cmd_init(args: argparse.Namespace) -> None:
         write_file(
             example_dir / "README.md", readme_kotlin(kotlin_version, jdk_version, default_platform), args.force
         )
+        if not (out_dir / ".editorconfig").exists() or args.force:
+            write_file(out_dir / ".editorconfig", editorconfig_config(), args.force)
         config["languages"]["kotlin"] = {
             "version": kotlin_version,
             "platform": default_platform,
@@ -1506,6 +1906,16 @@ def cmd_init(args: argparse.Namespace) -> None:
     write_file(out_dir / "MODULE.bazel", render_module_bazel(config), True)
     write_file(out_dir / ".bazelrc", render_bazelrc(config, default_platform), True)
     write_file(out_dir / "README.md", render_root_readme(config, default_platform), True)
+
+    # tools/lint/* is likewise composed across every configured language (see
+    # LINT_ASPECT_NAMES) and fully regenerated each init; None means no
+    # configured language needs it (e.g. a scala- or haskell-only project).
+    lint_build_bazel = render_lint_build_bazel(config["languages"])
+    if lint_build_bazel is not None:
+        write_file(out_dir / "tools" / "lint" / "BUILD.bazel", lint_build_bazel, True)
+    lint_linters_bzl = render_lint_linters_bzl(config["languages"])
+    if lint_linters_bzl is not None:
+        write_file(out_dir / "tools" / "lint" / "linters.bzl", lint_linters_bzl, True)
 
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"wrote {config_path}")
