@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""easy_build: scaffold a hermetic C++/Bazel project built entirely on clang/LLVM.
+
+No host compiler (gcc, Xcode clang, MSVC, ...) is ever invoked. Bazel downloads
+a pinned clang/LLVM distribution (via the `toolchains_llvm` module) for the
+target platform and uses only that toolchain to compile and link.
+
+Supported target platforms (native builds, one platform per Bazel invocation):
+    linux_x86_64    linux_aarch64
+    macos_x86_64    macos_aarch64
+"""
+import argparse
+import json
+import platform as host_platform
+import sys
+from pathlib import Path
+
+DEFAULT_LLVM_VERSION = "20.1.7"  # newest LLVM release with prebuilt clang for
+                                 # linux-x86_64, linux-aarch64, macos-x86_64 AND
+                                 # macos-aarch64 in toolchains_llvm's dist table.
+
+SUPPORTED_PLATFORMS = {
+    "linux_x86_64": ("@platforms//os:linux", "@platforms//cpu:x86_64"),
+    "linux_aarch64": ("@platforms//os:linux", "@platforms//cpu:aarch64"),
+    "macos_x86_64": ("@platforms//os:macos", "@platforms//cpu:x86_64"),
+    "macos_aarch64": ("@platforms//os:macos", "@platforms//cpu:aarch64"),
+}
+
+CONFIG_FILE = ".bazel_cli_config.json"
+
+
+def detect_host_platform() -> str:
+    system = host_platform.system().lower()
+    machine = host_platform.machine().lower()
+    os_name = {"darwin": "macos", "linux": "linux"}.get(system)
+    cpu = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(machine)
+    if os_name is None or cpu is None:
+        raise SystemExit(
+            f"error: unsupported host ({system}/{machine}); "
+            f"pass --platform explicitly, one of: {', '.join(SUPPORTED_PLATFORMS)}"
+        )
+    return f"{os_name}_{cpu}"
+
+
+def module_bazel(llvm_version: str) -> str:
+    return f"""\
+module(
+    name = "easy_build_cpp_project",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "platforms", version = "1.1.0")
+bazel_dep(name = "rules_cc", version = "0.2.22")
+bazel_dep(name = "toolchains_llvm", version = "1.8.0")
+
+# Hermetic clang/LLVM toolchain. Bazel downloads this pinned distribution and
+# uses it exclusively -- no host gcc/clang/Xcode/MSVC is consulted.
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    name = "llvm_toolchain",
+    llvm_version = "{llvm_version}",
+)
+use_repo(llvm, "llvm_toolchain")
+
+register_toolchains(
+    "@llvm_toolchain//:all",
+)
+"""
+
+
+def platforms_build() -> str:
+    lines = [
+        "# Target platform definitions for hermetic clang/LLVM cross-arch builds.",
+        "",
+    ]
+    for name, (os_c, cpu_c) in SUPPORTED_PLATFORMS.items():
+        lines.append("platform(")
+        lines.append(f'    name = "{name}",')
+        lines.append("    constraint_values = [")
+        lines.append(f'        "{os_c}",')
+        lines.append(f'        "{cpu_c}",')
+        lines.append("    ],")
+        lines.append(")")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def bazelrc(default_platform: str) -> str:
+    lines = [
+        "# === EASY_BUILD:BEGIN CPP ===",
+        "# Hermetic clang/LLVM toolchain only -- no host compiler is used.",
+    ]
+    for name in SUPPORTED_PLATFORMS:
+        lines.append(f"build:{name} --platforms=//platforms:{name}")
+    lines.append("")
+    lines.append(f"build --config={default_platform}")
+    lines.append("# === EASY_BUILD:END CPP ===")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_bazel() -> str:
+    return """\
+load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
+
+cc_binary(
+    name = "hello",
+    srcs = ["hello.cpp"],
+)
+"""
+
+
+def hello_cpp() -> str:
+    return """\
+#include <cstdio>
+
+int main() {
+    std::printf("Hello from a hermetic Bazel + clang/LLVM toolchain!\\n");
+
+#if defined(__APPLE__)
+    std::printf("OS:   macOS\\n");
+#elif defined(__linux__)
+    std::printf("OS:   Linux\\n");
+#else
+    std::printf("OS:   unknown\\n");
+#endif
+
+#if defined(__aarch64__)
+    std::printf("Arch: aarch64\\n");
+#elif defined(__x86_64__)
+    std::printf("Arch: x86_64\\n");
+#else
+    std::printf("Arch: unknown\\n");
+#endif
+
+#if defined(__clang__)
+    std::printf("Compiler: clang %s\\n", __clang_version__);
+#else
+    std::printf("Compiler: NOT clang (host toolchain leaked in!)\\n");
+#endif
+
+    return 0;
+}
+"""
+
+
+def readme(llvm_version: str, default_platform: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic C++ project (clang/LLVM via Bazel)
+
+This project was scaffolded by `easy_build init --language=cpp`. It builds
+entirely with a clang/LLVM toolchain that Bazel downloads itself (via the
+`toolchains_llvm` module, pinned to LLVM {llvm_version}). Your system compiler
+(gcc, Xcode clang, MSVC, ...) is never invoked -- only Bazel and a Python 3
+interpreter (used by Bazel's own repository rules) are required on the host.
+
+## Supported target platforms
+
+{platform_list}
+
+Each is a *native* build target: run the matching `--config` on a machine of
+that exact OS/arch (e.g. in a CI matrix) and Bazel downloads and uses clang/LLVM
+{llvm_version} built for that platform -- your system compiler is never invoked.
+This mirrors how `toolchains_llvm` itself recommends using it: one hermetic
+toolchain per real host, not one machine cross-building all four.
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //:hello
+bazel run   //:hello
+
+# Explicitly target a platform (only correct when run on a matching host):
+bazel build --config=linux_x86_64  //:hello
+bazel build --config=linux_aarch64 //:hello
+bazel build --config=macos_x86_64  //:hello
+bazel build --config=macos_aarch64 //:hello
+```
+
+## Verifying no host compiler is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("CppCompile", //:hello)' | grep -A1 'Command Line'
+```
+
+The executable must be under `external/toolchains_llvm++llvm+llvm_toolchain/...`.
+If it ever points at `/usr/bin/clang`, an Xcode path, or
+`external/apple_support+/...` / `external/local_config_cc/...`, host tooling is
+being used -- stop and investigate before trusting the build.
+
+### A real limitation on macOS: mismatched arch silently uses Xcode
+
+Only the config matching your **current** machine is guaranteed hermetic.
+Running `--config=macos_x86_64` on Apple Silicon (or `--config=macos_aarch64`
+on an Intel Mac) does **not** fail -- `rules_cc` depends on `apple_support`,
+which auto-registers a fallback toolchain backed by the *system* Xcode clang
+for whichever Apple arch our hermetic LLVM download doesn't natively cover.
+Bazel's toolchain resolution then silently falls through to it. This isn't a
+gap in this scaffold's config; `toolchains_llvm` only synthesizes a working
+cc_toolchain when the LLVM distribution's exec arch equals the target arch,
+and there is no redistributable macOS SDK sysroot to cross that gap hermetically
+(Apple's SDK license forbids it) -- so it can't be closed without a real
+machine of that arch.
+
+Linux does not have this problem: requesting a mismatched Linux `--config` on
+any host fails the build outright (no toolchain found) rather than silently
+substituting a host compiler -- verified by running `--config=linux_aarch64`
+from an aarch64 macOS host above.
+
+**Practical rule: only build a given `--config` on a real machine of that
+OS/arch** (e.g. one CI runner per platform). Use the verification command
+above whenever you're unsure.
+
+## Files
+
+- `MODULE.bazel` -- declares the hermetic `toolchains_llvm` toolchain and
+  registers it ahead of Bazel's built-in host-autodetected one.
+- `platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `.bazelrc` -- one `build:<platform>` config per target, defaulting to
+  `{default_platform}` for this host.
+- `BUILD.bazel` / `hello.cpp` -- a sample `cc_binary` that prints its OS,
+  arch, and confirms it was compiled with clang.
+"""
+
+
+def write_file(path: Path, content: str, force: bool) -> None:
+    if path.exists() and not force:
+        existing = path.read_text()
+        if existing == content:
+            return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    print(f"wrote {path}")
+
+
+def cmd_init(args: argparse.Namespace) -> None:
+    if args.language != "cpp":
+        raise SystemExit(f"error: unsupported --language '{args.language}' (only 'cpp' is supported)")
+
+    default_platform = args.platform or detect_host_platform()
+    if default_platform not in SUPPORTED_PLATFORMS:
+        raise SystemExit(
+            f"error: unsupported --platform '{default_platform}'; "
+            f"choose one of: {', '.join(SUPPORTED_PLATFORMS)}"
+        )
+
+    llvm_version = args.version or DEFAULT_LLVM_VERSION
+    out_dir = Path(args.dir).resolve()
+
+    write_file(out_dir / "MODULE.bazel", module_bazel(llvm_version), args.force)
+    write_file(out_dir / "platforms" / "BUILD.bazel", platforms_build(), args.force)
+    write_file(out_dir / ".bazelrc", bazelrc(default_platform), args.force)
+    write_file(out_dir / "BUILD.bazel", build_bazel(), args.force)
+    if not (out_dir / "hello.cpp").exists() or args.force:
+        write_file(out_dir / "hello.cpp", hello_cpp(), args.force)
+    write_file(out_dir / "README.md", readme(llvm_version, default_platform), args.force)
+
+    config_path = out_dir / CONFIG_FILE
+    config = json.loads(config_path.read_text()) if config_path.exists() else {"languages": {}}
+    config["languages"]["cpp"] = {
+        "version": llvm_version,
+        "platform": default_platform,
+        "toolchain": "toolchains_llvm",
+        "dependencies": {},
+    }
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+    print(f"wrote {config_path}")
+
+    print(f"\nDone. Default target platform for this host: {default_platform}")
+    print("Next: bazel run //:hello")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="easy_build",
+        description="Scaffold a hermetic C++ Bazel project built with clang/LLVM (no host compiler).",
+        epilog="""\
+example:
+  # Autodetect host OS/arch (e.g. macos_aarch64 on Apple Silicon):
+  ./easy_build init --language=cpp
+
+  # Pin an explicit LLVM version and target platform:
+  ./easy_build init --language=cpp --version=20.1.7 --platform=linux_x86_64
+  ./easy_build init --language=cpp --version=20.1.7 --platform=linux_aarch64
+  ./easy_build init --language=cpp --version=20.1.7 --platform=macos_x86_64
+  ./easy_build init --language=cpp --version=20.1.7 --platform=macos_aarch64
+""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    init = sub.add_parser("init", help="scaffold a new project in --dir (default: cwd)")
+    init.add_argument("--language", default="cpp", choices=["cpp"], help="project language (only cpp supported)")
+    init.add_argument("--version", default=None, help=f"LLVM/clang version (default: {DEFAULT_LLVM_VERSION})")
+    init.add_argument(
+        "--platform",
+        default=None,
+        choices=sorted(SUPPORTED_PLATFORMS),
+        help="target platform (default: autodetect from host OS/arch)",
+    )
+    init.add_argument("--dir", default=".", help="directory to scaffold into (default: current directory)")
+    init.add_argument("--force", action="store_true", help="overwrite existing files unconditionally")
+    init.set_defaults(func=cmd_init)
+
+    return parser
+
+
+def main(argv=None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.func(args)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
