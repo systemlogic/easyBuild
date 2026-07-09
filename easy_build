@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
-"""easy_build: scaffold a hermetic C++/Bazel project built entirely on clang/LLVM.
+"""easy_build: scaffold a hermetic Bazel project (cpp, java, python, go, rust,
+kotlin, scala, or haskell).
 
-No host compiler (gcc, Xcode clang, MSVC, ...) is ever invoked. Bazel downloads
-a pinned clang/LLVM distribution (via the `toolchains_llvm` module) for the
-target platform and uses only that toolchain to compile and link.
+No host toolchain is ever invoked. Bazel downloads a pinned, prebuilt
+toolchain distribution for the target platform and uses only that:
+
+    cpp     -- clang/LLVM, via the `toolchains_llvm` module
+    java    -- a remote JDK, via the `rules_java` module
+    python  -- a standalone CPython (python-build-standalone), via `rules_python`,
+               with pip dependency management and a self-contained zip binary
+    go      -- a remote Go SDK, via the `rules_go` module
+    rust    -- a remote rustc/cargo toolchain, via the `rules_rust` module
+    kotlin  -- a remote kotlinc, via the `rules_kotlin` module (JVM target: also
+               pins its own hermetic remotejdk, composing with `java` if present)
+    scala   -- a remote Scala compiler, via the `rules_scala` module (JVM
+               target: also pins its own hermetic remotejdk, as with kotlin)
+    haskell -- a remote GHC, via the `rules_haskell` module
+
+Languages compose: running `init` for another language adds to the shared
+`MODULE.bazel` / `.bazelrc` rather than replacing them, and each language's
+sample program lives in its own `example/<language>/` package, so
+`example/cpp`, `example/java`, `example/python`, `example/go`, `example/rust`,
+`example/kotlin`, `example/scala`, and `example/haskell` can all coexist.
 
 Supported target platforms (native builds, one platform per Bazel invocation):
     linux_x86_64    linux_aarch64
@@ -19,11 +37,54 @@ DEFAULT_LLVM_VERSION = "20.1.7"  # newest LLVM release with prebuilt clang for
                                  # linux-x86_64, linux-aarch64, macos-x86_64 AND
                                  # macos-aarch64 in toolchains_llvm's dist table.
 
+DEFAULT_JAVA_VERSION = "21"  # LTS JDK with a prebuilt remotejdk for all four
+                             # platforms below in rules_java's dist table.
+
+DEFAULT_PYTHON_VERSION = "3.12"  # CPython release with a prebuilt
+                                 # python-build-standalone distribution for
+                                 # all four platforms below.
+
+DEFAULT_GO_VERSION = "1.26.5"  # rules_go's go_sdk extension resolves versions
+                               # dynamically against https://go.dev/dl/?mode=json
+                               # at fetch time, so the current latest stable
+                               # release is always a safe, resolvable pin.
+
+DEFAULT_RUST_VERSION = "1.96.1"  # current stable rustc/cargo release; rules_rust
+                                 # resolves toolchain archives/hashes dynamically
+                                 # against static.rust-lang.org channel manifests.
+
+DEFAULT_KOTLIN_VERSION = "2.4.0"  # the kotlinc release rules_kotlin 2.4.0 bundles
+                                  # as its own default (see versions.bzl's
+                                  # KOTLIN_CURRENT_COMPILER_RELEASE) -- pinning a
+                                  # different kotlinc requires a hand-supplied
+                                  # sha256, so this scaffold uses the bundled one.
+
+DEFAULT_SCALA_VERSION = "3.8.4"  # a Scala 3 release listed in rules_scala's own
+                                 # tested SCALA_3_VERSIONS set.
+
+DEFAULT_GHC_VERSION = "9.6.5"  # a widely-used stable GHC release available as a
+                               # prebuilt bindist for all four platforms below.
+
+SUPPORTED_LANGUAGES = ["cpp", "java", "python", "go", "rust", "kotlin", "scala", "haskell"]
+
 SUPPORTED_PLATFORMS = {
     "linux_x86_64": ("@platforms//os:linux", "@platforms//cpu:x86_64"),
     "linux_aarch64": ("@platforms//os:linux", "@platforms//cpu:aarch64"),
     "macos_x86_64": ("@platforms//os:macos", "@platforms//cpu:x86_64"),
     "macos_aarch64": ("@platforms//os:macos", "@platforms//cpu:aarch64"),
+}
+
+# bazel_dep entries each language needs, keyed by language, rendered in this
+# fixed order so regenerated MODULE.bazel files are stable/diffable.
+LANGUAGE_BAZEL_DEPS = {
+    "cpp": [("rules_cc", "0.2.22"), ("toolchains_llvm", "1.8.0")],
+    "java": [("rules_java", "9.6.1")],
+    "python": [("rules_python", "2.2.0")],
+    "go": [("rules_go", "0.61.1")],
+    "rust": [("rules_rust", "0.71.3")],
+    "kotlin": [("rules_kotlin", "2.4.0")],
+    "scala": [("rules_scala", "7.2.6")],
+    "haskell": [("rules_haskell", "1.0")],
 }
 
 CONFIG_FILE = ".bazel_cli_config.json"
@@ -42,35 +103,13 @@ def detect_host_platform() -> str:
     return f"{os_name}_{cpu}"
 
 
-def module_bazel(llvm_version: str) -> str:
-    return f"""\
-module(
-    name = "easy_build_cpp_project",
-    version = "0.1.0",
-)
-
-bazel_dep(name = "platforms", version = "1.1.0")
-bazel_dep(name = "rules_cc", version = "0.2.22")
-bazel_dep(name = "toolchains_llvm", version = "1.8.0")
-
-# Hermetic clang/LLVM toolchain. Bazel downloads this pinned distribution and
-# uses it exclusively -- no host gcc/clang/Xcode/MSVC is consulted.
-llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
-llvm.toolchain(
-    name = "llvm_toolchain",
-    llvm_version = "{llvm_version}",
-)
-use_repo(llvm, "llvm_toolchain")
-
-register_toolchains(
-    "@llvm_toolchain//:all",
-)
-"""
+def platform_config_lines() -> list:
+    return [f"build:{name} --platforms=//platforms:{name}" for name in SUPPORTED_PLATFORMS]
 
 
 def platforms_build() -> str:
     lines = [
-        "# Target platform definitions for hermetic clang/LLVM cross-arch builds.",
+        "# Target platform definitions for hermetic cross-arch builds.",
         "",
     ]
     for name, (os_c, cpu_c) in SUPPORTED_PLATFORMS.items():
@@ -85,21 +124,384 @@ def platforms_build() -> str:
     return "\n".join(lines)
 
 
-def bazelrc(default_platform: str) -> str:
+def write_file(path: Path, content: str, force: bool) -> None:
+    if path.exists() and not force:
+        existing = path.read_text()
+        if existing == content:
+            return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    print(f"wrote {path}")
+
+
+# ============================================================================
+# MODULE.bazel / .bazelrc: shared, composed from every configured language
+# ============================================================================
+
+def module_bazel_cpp_block(llvm_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN CPP ===
+# Hermetic clang/LLVM toolchain. Bazel downloads this pinned distribution and
+# uses it exclusively -- no host gcc/clang/Xcode/MSVC is consulted.
+llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
+llvm.toolchain(
+    name = "llvm_toolchain",
+    llvm_version = "{llvm_version}",
+)
+use_repo(llvm, "llvm_toolchain")
+
+register_toolchains(
+    "@llvm_toolchain//:all",
+)
+# === EASY_BUILD:END CPP ===
+"""
+
+
+def module_bazel_java_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN JAVA ===
+# rules_java registers a remotejdk_<version> distribution for every supported
+# platform in its own MODULE.bazel -- no extension call is needed here to get
+# them, just the bazel_dep above. It also registers a `local_jdk` toolchain
+# (the host's JAVA_HOME/`java`) as a fallback, so pinning
+# --java_runtime_version / --tool_java_runtime_version in .bazelrc (see below)
+# is what actually forces Bazel to use the downloaded JDK exclusively.
+# === EASY_BUILD:END JAVA ===
+"""
+
+
+def module_bazel_python_block(python_version: str) -> str:
+    python_version_us = python_version.replace(".", "_")
+    return f"""\
+# === EASY_BUILD:BEGIN PYTHON ===
+# Hermetic CPython toolchain. Bazel downloads a standalone, prebuilt CPython
+# {python_version} distribution (python-build-standalone) for each target
+# platform below and uses it exclusively -- the host's `python3` (pyenv,
+# Homebrew, /usr/bin/python3, ...) is never consulted.
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = "{python_version}",
+    is_default = True,
+)
+use_repo(python, "python_{python_version_us}")
+
+# pip configuration: direct dependencies go in example/python/requirements.in;
+# run `bazel run //example/python:requirements.update` to (re)generate the
+# hash-pinned requirements_lock.txt below, which pip.parse resolves against
+# the hermetic interpreter (never the host's pip).
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pip",
+    python_version = "{python_version}",
+    requirements_lock = "//example/python:requirements_lock.txt",
+)
+use_repo(pip, "pip")
+# === EASY_BUILD:END PYTHON ===
+"""
+
+
+def module_bazel_go_block(go_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN GO ===
+# Hermetic Go SDK. go_sdk.download resolves version {go_version} against
+# https://go.dev/dl/?mode=json (Go's own official release index, fetched at
+# build time) and downloads a prebuilt SDK for the target platform -- no host
+# `go` (GOROOT, a Homebrew/apt Go, ...) is ever consulted.
+go_sdk = use_extension("@rules_go//go:extensions.bzl", "go_sdk")
+go_sdk.download(version = "{go_version}")
+use_repo(go_sdk, "go_toolchains")
+
+register_toolchains(
+    "@go_toolchains//:all",
+)
+# === EASY_BUILD:END GO ===
+"""
+
+
+def module_bazel_rust_block(rust_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN RUST ===
+# Hermetic Rust toolchain. rust.toolchain downloads a prebuilt rustc/cargo
+# distribution for version {rust_version} from static.rust-lang.org for the
+# target platform -- no host `rustc`/`cargo` (rustup, a system package, ...)
+# is ever consulted.
+rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
+rust.toolchain(
+    edition = "2021",
+    versions = ["{rust_version}"],
+)
+use_repo(rust, "rust_toolchains")
+
+register_toolchains(
+    "@rust_toolchains//:all",
+)
+# === EASY_BUILD:END RUST ===
+"""
+
+
+def module_bazel_kotlin_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN KOTLIN ===
+# Hermetic Kotlin compiler. rules_kotlin's own bzlmod extension downloads its
+# pinned kotlinc/ksp distributions -- no host `kotlinc` is ever consulted.
+# Kotlin compiles to JVM bytecode, so it also needs a JDK to run on; see the
+# EASY_BUILD:BEGIN/END KOTLIN block in .bazelrc, which pins a hermetic
+# remotejdk of its own so `kt_jvm_binary` never falls back to a host JDK,
+# whether or not `easy_build init --language=java` was also run.
+kotlin_repositories = use_extension(
+    "@rules_kotlin//src/main/starlark/core/repositories:bzlmod_setup.bzl",
+    "rules_kotlin_extensions",
+)
+use_repo(kotlin_repositories, "com_github_jetbrains_kotlin", "com_github_google_ksp")
+# === EASY_BUILD:END KOTLIN ===
+"""
+
+
+def module_bazel_scala_block(scala_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN SCALA ===
+# Hermetic Scala toolchain. scala_deps.scala() downloads the {scala_version}
+# compiler/library artifacts -- no host `scalac` is ever consulted. Scala also
+# compiles to JVM bytecode: like Kotlin, its block in .bazelrc pins its own
+# hermetic remotejdk independently of whether `java` was also configured.
+scala_config = use_extension(
+    "@rules_scala//scala/extensions:config.bzl",
+    "scala_config",
+)
+scala_config.settings(
+    scala_version = "{scala_version}",
+)
+use_repo(scala_config, "rules_scala_config")
+
+scala_deps = use_extension(
+    "@rules_scala//scala/extensions:deps.bzl",
+    "scala_deps",
+)
+scala_deps.scala()
+# === EASY_BUILD:END SCALA ===
+"""
+
+
+def module_bazel_haskell_block(ghc_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN HASKELL ===
+# Hermetic GHC toolchain. haskell_toolchains.bindists downloads a prebuilt GHC
+# {ghc_version} distribution for the target platform -- no host `ghc` (ghcup,
+# stack, a system package, ...) is ever consulted.
+#
+# KNOWN ROUGH EDGE: rules_haskell's own canonical example
+# (tweag/rules_haskell/examples) uses a Nix toolchain rather than bindists, so
+# this bzlmod-only bindist path is less battle-tested. Run the verification
+# commands in example/haskell/README.md on your actual target OS/arch before
+# depending on this in production.
+haskell_toolchains = use_extension(
+    "@rules_haskell//extensions:haskell_toolchains.bzl",
+    "haskell_toolchains",
+)
+haskell_toolchains.bindists(
+    version = "{ghc_version}",
+)
+use_repo(haskell_toolchains, "all_bindist_toolchains")
+
+register_toolchains(
+    "@all_bindist_toolchains//:all",
+)
+# === EASY_BUILD:END HASKELL ===
+"""
+
+
+MODULE_BAZEL_BLOCK_BUILDERS = {
+    "cpp": lambda info: module_bazel_cpp_block(info["version"]),
+    "java": lambda info: module_bazel_java_block(),
+    "python": lambda info: module_bazel_python_block(info["version"]),
+    "go": lambda info: module_bazel_go_block(info["version"]),
+    "rust": lambda info: module_bazel_rust_block(info["version"]),
+    "kotlin": lambda info: module_bazel_kotlin_block(),
+    "scala": lambda info: module_bazel_scala_block(info["version"]),
+    "haskell": lambda info: module_bazel_haskell_block(info["version"]),
+}
+
+
+def render_module_bazel(config: dict) -> str:
+    languages = config["languages"]
     lines = [
-        "# === EASY_BUILD:BEGIN CPP ===",
-        "# Hermetic clang/LLVM toolchain only -- no host compiler is used.",
+        "module(",
+        '    name = "easy_build_project",',
+        '    version = "0.1.0",',
+        ")",
+        "",
+        'bazel_dep(name = "platforms", version = "1.1.0")',
     ]
-    for name in SUPPORTED_PLATFORMS:
-        lines.append(f"build:{name} --platforms=//platforms:{name}")
+    for lang in SUPPORTED_LANGUAGES:
+        if lang in languages:
+            for dep_name, dep_version in LANGUAGE_BAZEL_DEPS[lang]:
+                lines.append(f'bazel_dep(name = "{dep_name}", version = "{dep_version}")')
+    blocks = [
+        MODULE_BAZEL_BLOCK_BUILDERS[lang](languages[lang])
+        for lang in SUPPORTED_LANGUAGES
+        if lang in languages
+    ]
+    return "\n".join(lines) + "\n\n" + "\n".join(blocks)
+
+
+def bazelrc_cpp_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN CPP ===
+# Hermetic clang/LLVM toolchain only -- no host compiler is used. (Toolchain
+# registration lives in MODULE.bazel; shared platform configs are above.)
+# === EASY_BUILD:END CPP ===
+"""
+
+
+def bazelrc_java_block(java_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN JAVA ===
+# Hermetic remote JDK only -- no host `java`/`javac` (JAVA_HOME,
+# /usr/bin/java, ...) is used for either the target runtime or build tools.
+build --java_language_version={java_version}
+build --java_runtime_version=remotejdk_{java_version}
+build --tool_java_runtime_version=remotejdk_{java_version}
+# === EASY_BUILD:END JAVA ===
+"""
+
+
+def bazelrc_python_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN PYTHON ===
+# Hermetic CPython toolchain only -- no host python3 builds or runs this.
+# bootstrap_impl=script (rather than the default system_python) makes the
+# example/python:hello py_zipapp_binary self-executable: the downloaded
+# interpreter, stdlib, and pip dependencies are all bundled into its zip, so
+# it runs on the target machine with no Python installed there at all.
+build --@rules_python//python/config_settings:bootstrap_impl=script
+# === EASY_BUILD:END PYTHON ===
+"""
+
+
+def bazelrc_go_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN GO ===
+# Hermetic Go SDK only -- no host `go` is used. (Toolchain registration lives
+# in MODULE.bazel; shared platform configs are above.)
+# === EASY_BUILD:END GO ===
+"""
+
+
+def bazelrc_rust_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN RUST ===
+# Hermetic rustc/cargo only -- no host `rustc`/`cargo` is used. (Toolchain
+# registration lives in MODULE.bazel; shared platform configs are above.)
+# === EASY_BUILD:END RUST ===
+"""
+
+
+def bazelrc_kotlin_block(jdk_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN KOTLIN ===
+# Hermetic remote JDK for running/compiling kt_jvm_binary -- pinned here
+# independently of the `java` language block (may be duplicated with the same
+# value if both are configured; see MODULE.bazel's KOTLIN block for why).
+build --java_runtime_version=remotejdk_{jdk_version}
+build --tool_java_runtime_version=remotejdk_{jdk_version}
+# === EASY_BUILD:END KOTLIN ===
+"""
+
+
+def bazelrc_scala_block(jdk_version: str) -> str:
+    return f"""\
+# === EASY_BUILD:BEGIN SCALA ===
+# Hermetic remote JDK for running/compiling scala_binary -- pinned here
+# independently of the `java` language block (may be duplicated with the same
+# value if both are configured; see MODULE.bazel's SCALA block for why).
+build --java_runtime_version=remotejdk_{jdk_version}
+build --tool_java_runtime_version=remotejdk_{jdk_version}
+# === EASY_BUILD:END SCALA ===
+"""
+
+
+def bazelrc_haskell_block() -> str:
+    return """\
+# === EASY_BUILD:BEGIN HASKELL ===
+# Hermetic GHC bindist only -- no host `ghc` is used. (Toolchain registration
+# lives in MODULE.bazel; shared platform configs are above.)
+# === EASY_BUILD:END HASKELL ===
+"""
+
+
+BAZELRC_BLOCK_BUILDERS = {
+    "cpp": lambda info: bazelrc_cpp_block(),
+    "java": lambda info: bazelrc_java_block(info["version"]),
+    "python": lambda info: bazelrc_python_block(),
+    "go": lambda info: bazelrc_go_block(),
+    "rust": lambda info: bazelrc_rust_block(),
+    "kotlin": lambda info: bazelrc_kotlin_block(info["jdk_version"]),
+    "scala": lambda info: bazelrc_scala_block(info["jdk_version"]),
+    "haskell": lambda info: bazelrc_haskell_block(),
+}
+
+
+def render_bazelrc(config: dict, default_platform: str) -> str:
+    languages = config["languages"]
+    lines = [
+        "# Target platform definitions (shared across all configured languages).",
+    ]
+    lines.extend(platform_config_lines())
     lines.append("")
     lines.append(f"build --config={default_platform}")
-    lines.append("# === EASY_BUILD:END CPP ===")
+    lines.append("")
+    blocks = [
+        BAZELRC_BLOCK_BUILDERS[lang](languages[lang])
+        for lang in SUPPORTED_LANGUAGES
+        if lang in languages
+    ]
+    return "\n".join(lines) + "\n" + "\n".join(blocks)
+
+
+def render_root_readme(config: dict, default_platform: str) -> str:
+    languages = config["languages"]
+    lines = [
+        "# easy_build: hermetic multi-language Bazel workspace",
+        "",
+        "This workspace is scaffolded by `easy_build init --language=<lang>`, where",
+        f"`<lang>` is one of: {', '.join(SUPPORTED_LANGUAGES)}.",
+        "Every configured language shares one `MODULE.bazel` and one `.bazelrc`",
+        "(each language owns a marked `EASY_BUILD:BEGIN/END` block in both), and",
+        "gets its own sample program under `example/<language>/`. Running `init`",
+        "for a new language adds its block/example rather than replacing an",
+        "existing language's.",
+        "",
+        "## Configured languages",
+        "",
+    ]
+    configured = [lang for lang in SUPPORTED_LANGUAGES if lang in languages]
+    if not configured:
+        lines.append(f"_(none yet -- run `easy_build init --language={SUPPORTED_LANGUAGES[0]}`)_")
+    for lang in configured:
+        info = languages[lang]
+        lines.append(
+            f"- **{lang}** (v{info['version']}) -- `example/{lang}/README.md`, "
+            f"`bazel run //example/{lang}:hello`"
+        )
+    lines.append("")
+    lines.append(f"Default target platform for this host: `{default_platform}`")
+    lines.append("")
+    lines.append("## Files")
+    lines.append("")
+    lines.append("- `MODULE.bazel` / `.bazelrc` -- shared toolchain registration and")
+    lines.append("  flags, one marked block per configured language.")
+    lines.append("- `platforms/BUILD.bazel` -- the four target `platform()` definitions.")
+    lines.append("- `example/<language>/` -- that language's sample program, `BUILD.bazel`,")
+    lines.append("  and its own `README.md` with language-specific usage/verification steps.")
     lines.append("")
     return "\n".join(lines)
 
 
-def build_bazel() -> str:
+# ============================================================================
+# cpp: hermetic clang/LLVM via toolchains_llvm
+# ============================================================================
+
+def build_bazel_cpp() -> str:
     return """\
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 
@@ -144,7 +546,7 @@ int main() {
 """
 
 
-def readme(llvm_version: str, default_platform: str) -> str:
+def readme_cpp(llvm_version: str, default_platform: str) -> str:
     platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
     return f"""\
 # easy_build: hermetic C++ project (clang/LLVM via Bazel)
@@ -169,20 +571,20 @@ toolchain per real host, not one machine cross-building all four.
 
 ```sh
 # Uses the default --config for this host ({default_platform}):
-bazel build //:hello
-bazel run   //:hello
+bazel build //example/cpp:hello
+bazel run   //example/cpp:hello
 
 # Explicitly target a platform (only correct when run on a matching host):
-bazel build --config=linux_x86_64  //:hello
-bazel build --config=linux_aarch64 //:hello
-bazel build --config=macos_x86_64  //:hello
-bazel build --config=macos_aarch64 //:hello
+bazel build --config=linux_x86_64  //example/cpp:hello
+bazel build --config=linux_aarch64 //example/cpp:hello
+bazel build --config=macos_x86_64  //example/cpp:hello
+bazel build --config=macos_aarch64 //example/cpp:hello
 ```
 
 ## Verifying no host compiler is used
 
 ```sh
-bazel aquery --config={default_platform} 'mnemonic("CppCompile", //:hello)' | grep -A1 'Command Line'
+bazel aquery --config={default_platform} 'mnemonic("CppCompile", //example/cpp:hello)' | grep -A1 'Command Line'
 ```
 
 The executable must be under `external/toolchains_llvm++llvm+llvm_toolchain/...`.
@@ -215,30 +617,749 @@ above whenever you're unsure.
 
 ## Files
 
-- `MODULE.bazel` -- declares the hermetic `toolchains_llvm` toolchain and
-  registers it ahead of Bazel's built-in host-autodetected one.
-- `platforms/BUILD.bazel` -- the four target `platform()` definitions.
-- `.bazelrc` -- one `build:<platform>` config per target, defaulting to
+- `//MODULE.bazel` (workspace root) -- declares the hermetic `toolchains_llvm`
+  toolchain and registers it ahead of Bazel's built-in host-autodetected one,
+  in this language's `EASY_BUILD:BEGIN/END CPP` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- one `build:<platform>` config per target, defaulting to
   `{default_platform}` for this host.
-- `BUILD.bazel` / `hello.cpp` -- a sample `cc_binary` that prints its OS,
-  arch, and confirms it was compiled with clang.
+- `BUILD.bazel` / `hello.cpp` (this directory) -- a sample `cc_binary` that
+  prints its OS, arch, and confirms it was compiled with clang.
 """
 
 
-def write_file(path: Path, content: str, force: bool) -> None:
-    if path.exists() and not force:
-        existing = path.read_text()
-        if existing == content:
-            return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content)
-    print(f"wrote {path}")
+# ============================================================================
+# java: hermetic remote JDK via rules_java
+# ============================================================================
+
+def build_bazel_java() -> str:
+    return """\
+load("@rules_java//java:defs.bzl", "java_binary")
+
+java_binary(
+    name = "hello",
+    srcs = ["Hello.java"],
+    main_class = "Hello",
+)
+"""
+
+
+def hello_java() -> str:
+    return """\
+public final class Hello {
+    public static void main(String[] args) {
+        System.out.println("Hello from a hermetic Bazel + remote JDK toolchain!");
+        System.out.println("OS:        " + System.getProperty("os.name"));
+        System.out.println("Arch:      " + System.getProperty("os.arch"));
+        System.out.println("Java:      " + System.getProperty("java.version"));
+        // java.home must point under Bazel's execroot/external tree, not a
+        // system JDK install (e.g. /Library/Java/... or /usr/lib/jvm/...).
+        System.out.println("java.home: " + System.getProperty("java.home"));
+    }
+}
+"""
+
+
+def readme_java(default_platform: str, java_version: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Java project (remote JDK via Bazel)
+
+This project was scaffolded by `easy_build init --language=java`. It builds
+and runs entirely with a JDK {java_version} distribution that Bazel downloads
+itself (via the `rules_java` module's `remotejdk_{java_version}` repositories).
+Your system JDK (`JAVA_HOME`, `/usr/bin/java`, a system package manager JDK,
+...) is never invoked -- only Bazel and a Python 3 interpreter (used by
+Bazel's own repository rules) are required on the host.
+
+## Supported target platforms
+
+{platform_list}
+
+Each is a *native* build target: run the matching `--config` on a machine of
+that exact OS/arch and Bazel downloads and uses the JDK {java_version}
+`remotejdk` distribution built for that platform.
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //example/java:hello
+bazel run   //example/java:hello
+
+# Explicitly target a platform (only correct when run on a matching host):
+bazel build --config=linux_x86_64  //example/java:hello
+bazel build --config=linux_aarch64 //example/java:hello
+bazel build --config=macos_x86_64  //example/java:hello
+bazel build --config=macos_aarch64 //example/java:hello
+```
+
+## Verifying no host JDK is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("Javac", //example/java:hello)' | grep -A1 'Command Line'
+bazel run --config={default_platform} //example/java:hello   # check the printed java.home
+```
+
+Both paths must be under `external/rules_java++toolchains+remotejdk*/...` --
+some downloaded remotejdk, though not necessarily the same version number as
+`{java_version}`: `rules_java`'s default `java_toolchain` may run the `javac`
+compiler itself on a different (typically newer) bootstrap JDK than the one
+`--java_runtime_version` selects for *running* `hello`; both are hermetic
+remotejdk downloads, so this mismatch is expected and fine. If `java.home`
+ever points at `/Library/Java/...`, `/usr/lib/jvm/...`, or anywhere referenced
+by `JAVA_HOME`, host tooling is being used -- stop and investigate before
+trusting the build (most likely `--java_runtime_version` was overridden back
+to `local_jdk` on the command line or in a `.bazelrc`
+further down the include chain).
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- depends on `rules_java`, whose own
+  remote-JDK toolchains become available automatically, in this language's
+  `EASY_BUILD:BEGIN/END JAVA` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- pins `--java_runtime_version`/`--tool_java_runtime_version`
+  to the downloaded `remotejdk_{java_version}`, plus one `build:<platform>`
+  config per target, defaulting to `{default_platform}` for this host.
+- `BUILD.bazel` / `Hello.java` (this directory) -- a sample `java_binary` that
+  prints its OS, arch, JDK version, and `java.home`.
+"""
+
+
+# ============================================================================
+# python: hermetic CPython via rules_python, with pip + self-contained zip
+# ============================================================================
+
+CERTIFI_VERSION = "2026.6.17"
+CERTIFI_WHEEL_SHA256 = "2227dcbaafe0d2f59279d1762ddddc37783ed4354594f194ffc31d20f41fc3db"
+CERTIFI_SDIST_SHA256 = "024c88eeec92ca068db80f02b8b07c9cef7b9fe261d1d535abfd5abd6f6af432"
+
+
+def build_bazel_python() -> str:
+    return """\
+load("@pip//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_binary")
+load("@rules_python//python:pip.bzl", "compile_pip_requirements")
+load("@rules_python//python/zipapp:py_zipapp_binary.bzl", "py_zipapp_binary")
+
+# `bazel run //example/python:requirements.update` regenerates
+# requirements_lock.txt (with hashes) from requirements.in using the hermetic
+# interpreter's pip.
+compile_pip_requirements(
+    name = "requirements",
+    src = "requirements.in",
+    requirements_txt = "requirements_lock.txt",
+)
+
+py_binary(
+    name = "hello_lib",
+    srcs = ["hello.py"],
+    main = "hello.py",
+    deps = [requirement("certifi")],
+)
+
+# Packages hello_lib as a single self-executable zipapp: the hermetic
+# interpreter, stdlib, and resolved pip wheels are all bundled inside, so
+# bazel-bin/example/python/hello.pyz runs standalone on a matching target
+# machine.
+py_zipapp_binary(
+    name = "hello",
+    binary = ":hello_lib",
+)
+"""
+
+
+def hello_py() -> str:
+    return """\
+import platform
+import sys
+
+import certifi
+
+
+def main() -> None:
+    print("Hello from a hermetic Bazel + CPython toolchain!")
+    print(f"OS:          {platform.system()}")
+    print(f"Arch:        {platform.machine()}")
+    print(f"Python:      {sys.version.split()[0]}")
+    # sys.executable must point under Bazel's runfiles/execroot tree (or, once
+    # zipped, inside the self-extracted archive) -- never a host interpreter.
+    print(f"Interpreter: {sys.executable}")
+    print(f"certifi (pip dependency) bundle: {certifi.where()}")
+
+
+if __name__ == "__main__":
+    main()
+"""
+
+
+def requirements_in() -> str:
+    return """\
+certifi=={version}
+""".format(version=CERTIFI_VERSION)
+
+
+def requirements_lock() -> str:
+    return f"""\
+#
+# This file is autogenerated by pip-compile via rules_python's
+# compile_pip_requirements. To update, run:
+#
+#    bazel run //example/python:requirements.update
+#
+certifi=={CERTIFI_VERSION} \\
+    --hash=sha256:{CERTIFI_WHEEL_SHA256} \\
+    --hash=sha256:{CERTIFI_SDIST_SHA256}
+    # via -r requirements.in
+"""
+
+
+def readme_python(default_platform: str, python_version: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Python project (CPython via Bazel, with pip)
+
+This project was scaffolded by `easy_build init --language=python`. It builds
+and runs entirely with a standalone CPython {python_version} distribution that
+Bazel downloads itself (via `rules_python`'s hermetic toolchain, backed by the
+`python-build-standalone` project). Your system Python (pyenv, Homebrew,
+`/usr/bin/python3`, a venv, ...) is never invoked -- only Bazel is required on
+the host.
+
+## Supported target platforms
+
+{platform_list}
+
+Each is a *native* build target: run the matching `--config` on a machine of
+that exact OS/arch and Bazel downloads and uses the CPython {python_version}
+`python-build-standalone` distribution built for that platform.
+
+## pip configuration
+
+Direct dependencies go in `requirements.in` (currently just `certifi`, used by
+`hello.py` to prove pip wiring works end-to-end). `pip.parse` in the workspace
+root `MODULE.bazel` resolves `requirements_lock.txt` -- a hash-pinned,
+fully-resolved lock file -- against the *hermetic* interpreter, never the
+host's pip/site-packages.
+
+```sh
+# After editing requirements.in, regenerate the hash-pinned lock file:
+bazel run //example/python:requirements.update
+```
+
+## Producing a self-contained binary
+
+```sh
+bazel build //example/python:hello
+# -> bazel-bin/example/python/hello.pyz  (a self-executable zipapp)
+```
+
+`BUILD.bazel` defines `hello_lib` as a plain `py_binary`, then wraps it with
+`py_zipapp_binary` (the current, non-deprecated replacement for the old
+`--build_python_zip` flag) as the public `hello` target. The workspace root
+`.bazelrc` sets `--@rules_python//python/config_settings:bootstrap_impl=script`,
+which is what makes the zipapp self-executable instead of requiring
+`python3 hello.pyz`. Combined with the hermetic toolchain above,
+`bazel-bin/example/python/hello.pyz` packs the downloaded CPython interpreter,
+its standard library, and all resolved pip wheels (here, `certifi`) into one
+file. Copy it to any machine matching the target platform and run it
+directly -- no Python installation, venv, or `pip install` is required there:
+
+```sh
+cp bazel-bin/example/python/hello.pyz /tmp/hello
+/tmp/hello
+```
+
+## Verifying no host Python is used
+
+```sh
+bazel run --config={default_platform} //example/python:hello   # check the printed Interpreter path
+env -i ./bazel-bin/example/python/hello.pyz                     # empty environment: no PATH, no PYTHONHOME
+```
+
+The printed interpreter path must be under `external/rules_python+...` (or,
+for the zipapp, a self-extracted temp dir originating from it) -- never
+`/usr/bin/python3`, a Homebrew path, or an active venv's `bin/python`. The
+`env -i` run proves the zipapp doesn't fall back to `$PATH` to find a Python.
+
+### A known rough edge
+
+`py_zipapp_binary` and `bootstrap_impl=script` are younger and less
+battle-tested than the plain hermetic toolchain, and the zip + script
+bootstrap combination has had platform-specific bugs upstream (e.g.
+bazel-contrib/rules_python#2030, #2596). Run the verification commands above
+on your actual target OS/arch before depending on this in production, and be
+ready to bump the `rules_python` version pinned in `MODULE.bazel` if you hit
+one.
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_python`
+  toolchain (`python.toolchain`) and pip configuration (`pip.parse`), in this
+  language's `EASY_BUILD:BEGIN/END PYTHON` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- forces the zip + script bootstrap for self-contained output,
+  plus one `build:<platform>` config per target, defaulting to
+  `{default_platform}` for this host.
+- `requirements.in` / `requirements_lock.txt` (this directory) -- direct and
+  hash-pinned pip dependencies.
+- `BUILD.bazel` / `hello.py` (this directory) -- `hello_lib` is a `py_binary`
+  that prints its OS, arch, interpreter path, and confirms the `certifi` pip
+  dependency resolved; `hello` wraps it with `py_zipapp_binary` into the
+  self-contained `bazel-bin/example/python/hello.pyz`.
+"""
+
+
+# ============================================================================
+# go: hermetic Go SDK via rules_go
+# ============================================================================
+
+def build_bazel_go() -> str:
+    return """\
+load("@rules_go//go:def.bzl", "go_binary")
+
+go_binary(
+    name = "hello",
+    srcs = ["hello.go"],
+    importpath = "easy_build/example/go/hello",
+)
+"""
+
+
+def hello_go() -> str:
+    return """\
+package main
+
+import (
+	"fmt"
+	"runtime"
+)
+
+func main() {
+	fmt.Println("Hello from a hermetic Bazel + downloaded Go SDK toolchain!")
+	fmt.Printf("OS:     %s\\n", runtime.GOOS)
+	fmt.Printf("Arch:   %s\\n", runtime.GOARCH)
+	fmt.Printf("Go:     %s\\n", runtime.Version())
+	// rules_go deliberately links the binary with GOROOT set to the dummy
+	// value "GOROOT" so the real build-sandbox path never leaks into it; this
+	// prints exactly "GOROOT" unless a "GOROOT" env var is set at runtime and
+	// overrides it -- which is exactly what the `env -i` check below rules out.
+	fmt.Printf("GOROOT: %s\\n", runtime.GOROOT())
+}
+"""
+
+
+def readme_go(go_version: str, default_platform: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Go project (remote Go SDK via Bazel)
+
+This project was scaffolded by `easy_build init --language=go`. It builds and
+runs entirely with a Go {go_version} SDK that Bazel downloads itself (via the
+`rules_go` module's `go_sdk.download` extension, which resolves versions
+against `https://go.dev/dl/?mode=json` at fetch time). Your system Go
+(`GOROOT`, a Homebrew/apt install, `go` from `$PATH`, ...) is never invoked --
+only Bazel is required on the host.
+
+## Supported target platforms
+
+{platform_list}
+
+Each is a *native* build target: run the matching `--config` on a machine of
+that exact OS/arch and Bazel downloads and uses the Go {go_version} SDK built
+for that platform.
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //example/go:hello
+bazel run   //example/go:hello
+
+# Explicitly target a platform (only correct when run on a matching host):
+bazel build --config=linux_x86_64  //example/go:hello
+bazel build --config=linux_aarch64 //example/go:hello
+bazel build --config=macos_x86_64  //example/go:hello
+bazel build --config=macos_aarch64 //example/go:hello
+```
+
+## Verifying no host Go SDK is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("GoCompilePkg", //example/go:hello)' | grep -A1 'Command Line'
+env -i bazel-bin/example/go/hello_/hello   # empty environment: no PATH, no GOROOT
+```
+
+The compile action's tool paths must be under `external/rules_go++go_sdk+.../`
+-- never `/usr/local/go`, a Homebrew `Cellar` path, or anywhere on `$PATH`. The
+printed `GOROOT` should read exactly `GOROOT` (rules_go links in that literal
+placeholder so the real build-sandbox path never leaks into the binary); the
+`env -i` run proves that value isn't coming from a host `GOROOT` environment
+variable either -- if it ever printed a real filesystem path instead, some
+host environment leaked into the build or run.
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_go`
+  `go_sdk` toolchain, in this language's `EASY_BUILD:BEGIN/END GO` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- one `build:<platform>` config per target, defaulting to
+  `{default_platform}` for this host (Go itself needs no extra flags).
+- `BUILD.bazel` / `hello.go` (this directory) -- a sample `go_binary` that
+  prints its OS, arch, Go version, and `GOROOT`.
+"""
+
+
+# ============================================================================
+# rust: hermetic rustc/cargo via rules_rust
+# ============================================================================
+
+def build_bazel_rust() -> str:
+    return """\
+load("@rules_rust//rust:defs.bzl", "rust_binary")
+
+rust_binary(
+    name = "hello",
+    srcs = ["main.rs"],
+    edition = "2021",
+)
+"""
+
+
+def hello_rust() -> str:
+    return """\
+fn main() {
+    println!("Hello from a hermetic Bazel + downloaded Rust toolchain!");
+    println!("OS:   {}", std::env::consts::OS);
+    println!("Arch: {}", std::env::consts::ARCH);
+}
+"""
+
+
+def readme_rust(rust_version: str, default_platform: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Rust project (remote rustc/cargo via Bazel)
+
+This project was scaffolded by `easy_build init --language=rust`. It builds
+entirely with a Rust {rust_version} toolchain that Bazel downloads itself (via
+the `rules_rust` module's `rust.toolchain` extension, which resolves toolchain
+archives against `static.rust-lang.org` channel manifests). Your system Rust
+(`rustup`, a system package, `~/.cargo/bin`, ...) is never invoked -- only
+Bazel is required on the host.
+
+## Supported target platforms
+
+{platform_list}
+
+Each is a *native* build target: run the matching `--config` on a machine of
+that exact OS/arch and Bazel downloads and uses the Rust {rust_version}
+toolchain built for that platform.
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //example/rust:hello
+bazel run   //example/rust:hello
+
+# Explicitly target a platform (only correct when run on a matching host):
+bazel build --config=linux_x86_64  //example/rust:hello
+bazel build --config=linux_aarch64 //example/rust:hello
+bazel build --config=macos_x86_64  //example/rust:hello
+bazel build --config=macos_aarch64 //example/rust:hello
+```
+
+## Verifying no host Rust toolchain is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("Rustc", //example/rust:hello)' | grep -A1 'Command Line'
+```
+
+The `rustc` path must be under `external/rules_rust++rust+rust_.../bin/rustc`
+-- never `~/.cargo/bin/rustc`, `/usr/bin/rustc`, or a `rustup` shim. If it
+ever points there, host tooling is being used -- stop and investigate before
+trusting the build.
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_rust`
+  toolchain, in this language's `EASY_BUILD:BEGIN/END RUST` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- one `build:<platform>` config per target, defaulting to
+  `{default_platform}` for this host (Rust itself needs no extra flags).
+- `BUILD.bazel` / `main.rs` (this directory) -- a sample `rust_binary` that
+  prints its OS and arch.
+"""
+
+
+# ============================================================================
+# kotlin: hermetic kotlinc via rules_kotlin (JVM target; composes with java)
+# ============================================================================
+
+def build_bazel_kotlin() -> str:
+    return """\
+load("@rules_kotlin//kotlin:jvm.bzl", "kt_jvm_binary")
+
+kt_jvm_binary(
+    name = "hello",
+    srcs = ["Hello.kt"],
+    main_class = "HelloKt",
+)
+"""
+
+
+def hello_kotlin() -> str:
+    return """\
+fun main() {
+    println("Hello from a hermetic Bazel + downloaded Kotlin compiler, running on a hermetic JDK!")
+    println("OS:        " + System.getProperty("os.name"))
+    println("Arch:      " + System.getProperty("os.arch"))
+    println("Kotlin:    " + KotlinVersion.CURRENT)
+    // java.home must point under Bazel's execroot/external tree, not a system
+    // JDK install (e.g. /Library/Java/... or /usr/lib/jvm/...).
+    println("java.home: " + System.getProperty("java.home"))
+}
+"""
+
+
+def readme_kotlin(kotlin_version: str, jdk_version: str, default_platform: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Kotlin project (remote kotlinc via Bazel)
+
+This project was scaffolded by `easy_build init --language=kotlin`. It builds
+with a Kotlin {kotlin_version} compiler that Bazel downloads itself (via the
+`rules_kotlin` module's bzlmod extension). Your system `kotlinc` is never
+invoked -- only Bazel is required on the host.
+
+Kotlin compiles to JVM bytecode, so `kt_jvm_binary` also needs a JDK to run
+on. This language's `.bazelrc` block pins its own hermetic `remotejdk_{jdk_version}`
+(the same mechanism the `java` language uses) so it never falls back to a
+host JDK, whether or not you've also run `easy_build init --language=java`.
+**If you configure both `java` and `kotlin` with different `--version`s, the
+later block in `.bazelrc` wins** (Bazel's rc-file semantics: last occurrence
+of a single-valued flag applies) -- re-run `init --language=kotlin` after
+changing the java version to keep them in sync.
+
+## Supported target platforms
+
+{platform_list}
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //example/kotlin:hello
+bazel run   //example/kotlin:hello
+```
+
+## Verifying no host toolchain is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("KotlinCompile", //example/kotlin:hello)' | grep -A1 'Command Line'
+bazel run --config={default_platform} //example/kotlin:hello   # check the printed java.home
+```
+
+The compiler path must be under `external/rules_kotlin++...`, and `java.home`
+must be under `external/rules_java++toolchains+remotejdk_{jdk_version}*/...` --
+never a system `kotlinc` install or `/Library/Java/...` / `/usr/lib/jvm/...`.
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- depends on `rules_kotlin`, in this
+  language's `EASY_BUILD:BEGIN/END KOTLIN` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- pins `--java_runtime_version`/`--tool_java_runtime_version`
+  to `remotejdk_{jdk_version}` so `kt_jvm_binary` runs hermetically, plus one
+  `build:<platform>` config per target, defaulting to `{default_platform}`.
+- `BUILD.bazel` / `Hello.kt` (this directory) -- a sample `kt_jvm_binary` that
+  prints its OS, arch, Kotlin version, and `java.home`.
+"""
+
+
+# ============================================================================
+# scala: hermetic Scala compiler via rules_scala (JVM target; composes with java)
+# ============================================================================
+
+def build_bazel_scala() -> str:
+    return """\
+load("@rules_scala//scala:scala.bzl", "scala_binary")
+
+scala_binary(
+    name = "hello",
+    srcs = ["Hello.scala"],
+    main_class = "Hello",
+)
+"""
+
+
+def hello_scala() -> str:
+    return """\
+object Hello {
+  def main(args: Array[String]): Unit = {
+    println("Hello from a hermetic Bazel + downloaded Scala toolchain, running on a hermetic JDK!")
+    println(s"OS:        ${System.getProperty("os.name")}")
+    println(s"Arch:      ${System.getProperty("os.arch")}")
+    println(s"Scala:     ${util.Properties.versionString}")
+    // java.home must point under Bazel's execroot/external tree, not a system
+    // JDK install (e.g. /Library/Java/... or /usr/lib/jvm/...).
+    println(s"java.home: ${System.getProperty("java.home")}")
+  }
+}
+"""
+
+
+def readme_scala(scala_version: str, jdk_version: str, default_platform: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Scala project (remote Scala compiler via Bazel)
+
+This project was scaffolded by `easy_build init --language=scala`. It builds
+with a Scala {scala_version} compiler that Bazel downloads itself (via the
+`rules_scala` module's `scala_deps`/`scala_config` extensions). Your system
+`scalac` is never invoked -- only Bazel is required on the host.
+
+Scala compiles to JVM bytecode, so `scala_binary` also needs a JDK to run on.
+This language's `.bazelrc` block pins its own hermetic `remotejdk_{jdk_version}`
+(the same mechanism the `java` language uses) so it never falls back to a
+host JDK, whether or not you've also run `easy_build init --language=java`.
+**If you configure both `java` and `scala` with different `--version`s, the
+later block in `.bazelrc` wins** (Bazel's rc-file semantics: last occurrence
+of a single-valued flag applies) -- re-run `init --language=scala` after
+changing the java version to keep them in sync.
+
+## Supported target platforms
+
+{platform_list}
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //example/scala:hello
+bazel run   //example/scala:hello
+```
+
+## Verifying no host toolchain is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("Scalac", //example/scala:hello)' | grep -A1 'Command Line'
+bazel run --config={default_platform} //example/scala:hello   # check the printed java.home
+```
+
+The compiler path must be under `external/rules_scala++...`, and `java.home`
+must be under `external/rules_java++toolchains+remotejdk_{jdk_version}*/...` --
+never a system `scalac` install or `/Library/Java/...` / `/usr/lib/jvm/...`.
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- depends on `rules_scala`, in this
+  language's `EASY_BUILD:BEGIN/END SCALA` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- pins `--java_runtime_version`/`--tool_java_runtime_version`
+  to `remotejdk_{jdk_version}` so `scala_binary` runs hermetically, plus one
+  `build:<platform>` config per target, defaulting to `{default_platform}`.
+- `BUILD.bazel` / `Hello.scala` (this directory) -- a sample `scala_binary`
+  that prints its OS, arch, Scala version, and `java.home`.
+"""
+
+
+# ============================================================================
+# haskell: hermetic GHC via rules_haskell
+# ============================================================================
+
+def build_bazel_haskell() -> str:
+    return """\
+load("@rules_haskell//haskell:defs.bzl", "haskell_binary", "haskell_toolchain_library")
+
+# Exposes GHC's own bundled "base" package (shipped inside the downloaded GHC
+# bindist) as a Bazel target -- no Hackage/Stackage fetch is needed for it.
+haskell_toolchain_library(
+    name = "base",
+)
+
+haskell_binary(
+    name = "hello",
+    srcs = ["Main.hs"],
+    deps = [":base"],
+)
+"""
+
+
+def hello_haskell() -> str:
+    return """\
+import System.Info (arch, compilerName, compilerVersion, os)
+import Data.Version (showVersion)
+
+main :: IO ()
+main = do
+  putStrLn "Hello from a hermetic Bazel + downloaded GHC toolchain!"
+  putStrLn ("OS:       " ++ os)
+  putStrLn ("Arch:     " ++ arch)
+  putStrLn ("Compiler: " ++ compilerName ++ " " ++ showVersion compilerVersion)
+"""
+
+
+def readme_haskell(ghc_version: str, default_platform: str) -> str:
+    platform_list = "\n".join(f"  - {p}" for p in SUPPORTED_PLATFORMS)
+    return f"""\
+# easy_build: hermetic Haskell project (remote GHC via Bazel)
+
+This project was scaffolded by `easy_build init --language=haskell`. It builds
+with a GHC {ghc_version} distribution that Bazel downloads itself (via the
+`rules_haskell` module's `haskell_toolchains.bindists` extension). Your system
+GHC (`ghcup`, `stack`, a system package, ...) is never invoked -- only Bazel is
+required on the host.
+
+## Supported target platforms
+
+{platform_list}
+
+## Usage
+
+```sh
+# Uses the default --config for this host ({default_platform}):
+bazel build //example/haskell:hello
+bazel run   //example/haskell:hello
+```
+
+## Verifying no host GHC is used
+
+```sh
+bazel aquery --config={default_platform} 'mnemonic("HaskellBuildBinary", //example/haskell:hello)' | grep -A1 'Command Line'
+```
+
+The `ghc`/build tool path must be under `external/rules_haskell++...` or
+`external/all_bindist_toolchains+.../` -- never a `ghcup`-managed install,
+`/usr/lib/ghc*`, or a `stack`-managed toolchain.
+
+### A known rough edge
+
+The `haskell_toolchains.bindists` bzlmod extension used here is a less
+battle-tested path than the rest of this scaffold: rules_haskell's own
+canonical example workspace (`tweag/rules_haskell/examples`) is configured to
+use a Nix toolchain instead of a bindist download. Run the verification
+command above on your actual target OS/arch before depending on this in
+production, and be ready to adjust the pinned GHC version if a bindist isn't
+published for your platform.
+
+## Files
+
+- `//MODULE.bazel` (workspace root) -- declares the hermetic `rules_haskell`
+  `haskell_toolchains` toolchain, in this language's
+  `EASY_BUILD:BEGIN/END HASKELL` block.
+- `//platforms/BUILD.bazel` -- the four target `platform()` definitions.
+- `//.bazelrc` -- one `build:<platform>` config per target, defaulting to
+  `{default_platform}` for this host (GHC itself needs no extra flags).
+- `BUILD.bazel` / `Main.hs` (this directory) -- a sample `haskell_binary`
+  (with `base` imported via `haskell_toolchain_library`) that prints its OS,
+  arch, and compiler version.
+"""
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    if args.language != "cpp":
-        raise SystemExit(f"error: unsupported --language '{args.language}' (only 'cpp' is supported)")
-
     default_platform = args.platform or detect_host_platform()
     if default_platform not in SUPPORTED_PLATFORMS:
         raise SystemExit(
@@ -246,54 +1367,208 @@ def cmd_init(args: argparse.Namespace) -> None:
             f"choose one of: {', '.join(SUPPORTED_PLATFORMS)}"
         )
 
-    llvm_version = args.version or DEFAULT_LLVM_VERSION
     out_dir = Path(args.dir).resolve()
-
-    write_file(out_dir / "MODULE.bazel", module_bazel(llvm_version), args.force)
-    write_file(out_dir / "platforms" / "BUILD.bazel", platforms_build(), args.force)
-    write_file(out_dir / ".bazelrc", bazelrc(default_platform), args.force)
-    write_file(out_dir / "BUILD.bazel", build_bazel(), args.force)
-    if not (out_dir / "hello.cpp").exists() or args.force:
-        write_file(out_dir / "hello.cpp", hello_cpp(), args.force)
-    write_file(out_dir / "README.md", readme(llvm_version, default_platform), args.force)
-
     config_path = out_dir / CONFIG_FILE
     config = json.loads(config_path.read_text()) if config_path.exists() else {"languages": {}}
-    config["languages"]["cpp"] = {
-        "version": llvm_version,
-        "platform": default_platform,
-        "toolchain": "toolchains_llvm",
-        "dependencies": {},
-    }
+
+    if args.language == "cpp":
+        llvm_version = args.version or DEFAULT_LLVM_VERSION
+        example_dir = out_dir / "example" / "cpp"
+        write_file(example_dir / "BUILD.bazel", build_bazel_cpp(), args.force)
+        if not (example_dir / "hello.cpp").exists() or args.force:
+            write_file(example_dir / "hello.cpp", hello_cpp(), args.force)
+        write_file(example_dir / "README.md", readme_cpp(llvm_version, default_platform), args.force)
+        config["languages"]["cpp"] = {
+            "version": llvm_version,
+            "platform": default_platform,
+            "toolchain": "toolchains_llvm",
+            "dependencies": {},
+        }
+
+    elif args.language == "java":
+        java_version = args.version or DEFAULT_JAVA_VERSION
+        example_dir = out_dir / "example" / "java"
+        write_file(example_dir / "BUILD.bazel", build_bazel_java(), args.force)
+        if not (example_dir / "Hello.java").exists() or args.force:
+            write_file(example_dir / "Hello.java", hello_java(), args.force)
+        write_file(example_dir / "README.md", readme_java(default_platform, java_version), args.force)
+        config["languages"]["java"] = {
+            "version": java_version,
+            "platform": default_platform,
+            "toolchain": "rules_java",
+            "dependencies": {},
+        }
+
+    elif args.language == "python":
+        python_version = args.version or DEFAULT_PYTHON_VERSION
+        example_dir = out_dir / "example" / "python"
+        write_file(example_dir / "BUILD.bazel", build_bazel_python(), args.force)
+        if not (example_dir / "hello.py").exists() or args.force:
+            write_file(example_dir / "hello.py", hello_py(), args.force)
+        if not (example_dir / "requirements.in").exists() or args.force:
+            write_file(example_dir / "requirements.in", requirements_in(), args.force)
+        if not (example_dir / "requirements_lock.txt").exists() or args.force:
+            write_file(example_dir / "requirements_lock.txt", requirements_lock(), args.force)
+        write_file(example_dir / "README.md", readme_python(default_platform, python_version), args.force)
+        config["languages"]["python"] = {
+            "version": python_version,
+            "platform": default_platform,
+            "toolchain": "rules_python",
+            "dependencies": {"certifi": CERTIFI_VERSION},
+        }
+
+    elif args.language == "go":
+        go_version = args.version or DEFAULT_GO_VERSION
+        example_dir = out_dir / "example" / "go"
+        write_file(example_dir / "BUILD.bazel", build_bazel_go(), args.force)
+        if not (example_dir / "hello.go").exists() or args.force:
+            write_file(example_dir / "hello.go", hello_go(), args.force)
+        write_file(example_dir / "README.md", readme_go(go_version, default_platform), args.force)
+        config["languages"]["go"] = {
+            "version": go_version,
+            "platform": default_platform,
+            "toolchain": "rules_go",
+            "dependencies": {},
+        }
+
+    elif args.language == "rust":
+        rust_version = args.version or DEFAULT_RUST_VERSION
+        example_dir = out_dir / "example" / "rust"
+        write_file(example_dir / "BUILD.bazel", build_bazel_rust(), args.force)
+        if not (example_dir / "main.rs").exists() or args.force:
+            write_file(example_dir / "main.rs", hello_rust(), args.force)
+        write_file(example_dir / "README.md", readme_rust(rust_version, default_platform), args.force)
+        config["languages"]["rust"] = {
+            "version": rust_version,
+            "platform": default_platform,
+            "toolchain": "rules_rust",
+            "dependencies": {},
+        }
+
+    elif args.language == "kotlin":
+        kotlin_version = args.version or DEFAULT_KOTLIN_VERSION
+        jdk_version = config["languages"].get("java", {}).get("version", DEFAULT_JAVA_VERSION)
+        example_dir = out_dir / "example" / "kotlin"
+        write_file(example_dir / "BUILD.bazel", build_bazel_kotlin(), args.force)
+        if not (example_dir / "Hello.kt").exists() or args.force:
+            write_file(example_dir / "Hello.kt", hello_kotlin(), args.force)
+        write_file(
+            example_dir / "README.md", readme_kotlin(kotlin_version, jdk_version, default_platform), args.force
+        )
+        config["languages"]["kotlin"] = {
+            "version": kotlin_version,
+            "platform": default_platform,
+            "toolchain": "rules_kotlin",
+            "dependencies": {},
+            "jdk_version": jdk_version,
+        }
+
+    elif args.language == "scala":
+        scala_version = args.version or DEFAULT_SCALA_VERSION
+        jdk_version = config["languages"].get("java", {}).get("version", DEFAULT_JAVA_VERSION)
+        example_dir = out_dir / "example" / "scala"
+        write_file(example_dir / "BUILD.bazel", build_bazel_scala(), args.force)
+        if not (example_dir / "Hello.scala").exists() or args.force:
+            write_file(example_dir / "Hello.scala", hello_scala(), args.force)
+        write_file(
+            example_dir / "README.md", readme_scala(scala_version, jdk_version, default_platform), args.force
+        )
+        config["languages"]["scala"] = {
+            "version": scala_version,
+            "platform": default_platform,
+            "toolchain": "rules_scala",
+            "dependencies": {},
+            "jdk_version": jdk_version,
+        }
+
+    elif args.language == "haskell":
+        ghc_version = args.version or DEFAULT_GHC_VERSION
+        example_dir = out_dir / "example" / "haskell"
+        write_file(example_dir / "BUILD.bazel", build_bazel_haskell(), args.force)
+        if not (example_dir / "Main.hs").exists() or args.force:
+            write_file(example_dir / "Main.hs", hello_haskell(), args.force)
+        write_file(example_dir / "README.md", readme_haskell(ghc_version, default_platform), args.force)
+        config["languages"]["haskell"] = {
+            "version": ghc_version,
+            "platform": default_platform,
+            "toolchain": "rules_haskell",
+            "dependencies": {},
+        }
+
+    else:
+        raise SystemExit(f"error: unsupported --language '{args.language}'")
+
+    # MODULE.bazel, .bazelrc, platforms/, and the root README are shared across
+    # every configured language, so they're always fully regenerated from the
+    # accumulated config -- this is what lets a later `init` for a different
+    # language add to them instead of clobbering an earlier language's setup.
+    write_file(out_dir / "platforms" / "BUILD.bazel", platforms_build(), True)
+    write_file(out_dir / "MODULE.bazel", render_module_bazel(config), True)
+    write_file(out_dir / ".bazelrc", render_bazelrc(config, default_platform), True)
+    write_file(out_dir / "README.md", render_root_readme(config, default_platform), True)
+
     config_path.write_text(json.dumps(config, indent=2) + "\n")
     print(f"wrote {config_path}")
 
     print(f"\nDone. Default target platform for this host: {default_platform}")
-    print("Next: bazel run //:hello")
+    print(f"Next: bazel run //example/{args.language}:hello")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="easy_build",
-        description="Scaffold a hermetic C++ Bazel project built with clang/LLVM (no host compiler).",
+        description=(
+            "Scaffold a hermetic Bazel project "
+            "(cpp, java, python, go, rust, kotlin, scala, or haskell; no host toolchain)."
+        ),
         epilog="""\
 example:
   # Autodetect host OS/arch (e.g. macos_aarch64 on Apple Silicon):
   ./easy_build init --language=cpp
+  ./easy_build init --language=java
+  ./easy_build init --language=python
+  ./easy_build init --language=go
+  ./easy_build init --language=rust
+  ./easy_build init --language=kotlin
+  ./easy_build init --language=scala
+  ./easy_build init --language=haskell
 
-  # Pin an explicit LLVM version and target platform:
-  ./easy_build init --language=cpp --version=20.1.7 --platform=linux_x86_64
-  ./easy_build init --language=cpp --version=20.1.7 --platform=linux_aarch64
-  ./easy_build init --language=cpp --version=20.1.7 --platform=macos_x86_64
-  ./easy_build init --language=cpp --version=20.1.7 --platform=macos_aarch64
+  # Pin an explicit toolchain version and target platform:
+  ./easy_build init --language=cpp     --version=20.1.7 --platform=linux_x86_64
+  ./easy_build init --language=java    --version=21      --platform=linux_aarch64
+  ./easy_build init --language=python  --version=3.12    --platform=macos_x86_64
+  ./easy_build init --language=go      --version=1.26.5  --platform=linux_x86_64
+  ./easy_build init --language=rust    --version=1.96.1  --platform=linux_aarch64
+  ./easy_build init --language=kotlin  --version=2.4.0   --platform=macos_x86_64
+  ./easy_build init --language=scala   --version=3.8.4   --platform=macos_aarch64
+  ./easy_build init --language=haskell --version=9.6.5   --platform=linux_x86_64
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
     init = sub.add_parser("init", help="scaffold a new project in --dir (default: cwd)")
-    init.add_argument("--language", default="cpp", choices=["cpp"], help="project language (only cpp supported)")
-    init.add_argument("--version", default=None, help=f"LLVM/clang version (default: {DEFAULT_LLVM_VERSION})")
+    init.add_argument(
+        "--language",
+        default="cpp",
+        choices=SUPPORTED_LANGUAGES,
+        help="project language (default: cpp)",
+    )
+    init.add_argument(
+        "--version",
+        default=None,
+        help=(
+            "toolchain version: LLVM/clang for cpp "
+            f"(default: {DEFAULT_LLVM_VERSION}), JDK for java "
+            f"(default: {DEFAULT_JAVA_VERSION}), CPython for python "
+            f"(default: {DEFAULT_PYTHON_VERSION}), Go SDK for go "
+            f"(default: {DEFAULT_GO_VERSION}), rustc/cargo for rust "
+            f"(default: {DEFAULT_RUST_VERSION}), kotlinc for kotlin "
+            f"(default: {DEFAULT_KOTLIN_VERSION}), Scala compiler for scala "
+            f"(default: {DEFAULT_SCALA_VERSION}), or GHC for haskell "
+            f"(default: {DEFAULT_GHC_VERSION})"
+        ),
+    )
     init.add_argument(
         "--platform",
         default=None,
