@@ -50,7 +50,7 @@ DEFAULT_PYTHON_VERSION = "3.12"  # CPython release with a prebuilt
                                  # python-build-standalone distribution for
                                  # all four platforms below.
 
-DEFAULT_GO_VERSION = "1.26.5"  # rules_go's go_sdk extension resolves versions
+DEFAULT_GO_VERSION = "0.59.0"  # rules_go's go_sdk extension resolves versions
                                # dynamically against https://go.dev/dl/?mode=json
                                # at fetch time, so the current latest stable
                                # release is always a safe, resolvable pin.
