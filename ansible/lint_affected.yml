@@ -1,0 +1,84 @@
+---
+# Affected-targets lint gate.
+#
+# Step 1 identifies the //example/... targets affected by the last commit,
+# via affected_targets.sh (the git-diff + `bazel query rdeps(...)` logic
+# copied from cross_platform/ansible/affected_server_targets.sh and
+# generalized to easy_build's full language list and example/ layout).
+#
+# Step 2 lints exactly those affected targets with `bazel build --config=lint`,
+# which runs each configured language's hermetic lint aspect (cpp: clang-tidy,
+# java: checkstyle, python: ruff, rust: clippy, kotlin: ktlint — see
+# tools/lint/linters.bzl, wired in by `easy_build init`) and fails the build
+# on any violation (--@aspect_rules_lint//lint:fail_on_violation, set in
+# .bazelrc's EASY_BUILD:BEGIN/END LINT block). go's nogo static analysis
+# instead runs on every normal compile, so a plain `bazel build` on an
+# affected go target already covers it; scala and haskell have no hermetic
+# Bazel-native linter wired in yet (see their example READMEs).
+#
+# Requires: a project already scaffolded with `easy_build init` (so
+# MODULE.bazel/.bazelrc/tools/lint exist) and `bazel` on PATH.
+#
+# Usage:
+#   ansible-playbook ansible/lint_affected.yml
+
+- name: Lint targets affected by the last commit
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    workspace_dir: "{{ playbook_dir }}/.."
+
+  tasks:
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 1: identify affected targets
+    # ══════════════════════════════════════════════════════════════════════
+    - name: "Step 1: determine affected //example/... targets for this commit"
+      ansible.builtin.command:
+        cmd: "{{ playbook_dir }}/affected_targets.sh"
+        chdir: "{{ workspace_dir }}"
+      register: affected_result
+      changed_when: false
+      failed_when: false
+
+    - name: Show affected-targets diagnostics
+      ansible.builtin.debug:
+        msg: "{{ affected_result.stderr_lines }}"
+      when: affected_result.stderr_lines | length > 0
+
+    - name: Set affected_targets fact
+      ansible.builtin.set_fact:
+        affected_targets: "{{ affected_result.stdout_lines | select('match', '^//') | list }}"
+
+    - name: Show affected targets
+      ansible.builtin.debug:
+        msg: >-
+          {{ affected_targets if affected_targets | length > 0
+             else 'No //example/... targets affected by the last commit.' }}
+
+    # ══════════════════════════════════════════════════════════════════════
+    # STEP 2: lint those targets
+    # ══════════════════════════════════════════════════════════════════════
+    - name: "Step 2: lint affected targets (bazel build --config=lint)"
+      ansible.builtin.command:
+        cmd: >-
+          bazel build --config=lint {{ affected_targets | join(' ') }}
+        chdir: "{{ workspace_dir }}"
+      register: lint_result
+      changed_when: false
+      failed_when: false
+      when: affected_targets | length > 0
+
+    - name: Show lint output
+      ansible.builtin.debug:
+        msg: "{{ (lint_result.stdout_lines | default([])) + (lint_result.stderr_lines | default([])) }}"
+      when: affected_targets | length > 0
+
+    - name: Fail if linting found violations
+      ansible.builtin.assert:
+        that:
+          - lint_result.rc == 0
+        fail_msg: "Lint check failed (rc={{ lint_result.rc }}) on affected targets — see output above."
+        success_msg: "All affected targets passed lint."
+      when: affected_targets | length > 0
