@@ -1,0 +1,3 @@
+# Exposes lint config files consumed by ansible/lint_affected.yml's
+# `bazel build --config=lint` step (see tools/lint/linters.bzl's Label refs).
+exports_files(["checkstyle.xml"])
