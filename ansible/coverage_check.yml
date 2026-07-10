@@ -1,0 +1,62 @@
+---
+# Patch coverage gate.
+#
+# Thin Ansible wrapper around coverage_check.sh: the script's patch-diff and
+# lcov parsing is inherently procedural (regex + running state), so it stays
+# in bash rather than being force-fit into Jinja. This playbook just exposes
+# its options as Ansible vars, runs it, and turns its exit code into a proper
+# ansible.builtin.assert so it composes with lint_affected.yml and the rest
+# of the pipeline.
+#
+# Ported from cross_platform/ansible/coverage_check.yml; coverage_check.sh
+# itself was adapted for easy_build's //example/... scaffold layout and its
+# 8 supported languages (see that script's header for details).
+#
+# Requires: a project already scaffolded with `easy_build init` and `bazel`
+# on PATH.
+#
+# Usage:
+#   ansible-playbook coverage_check.yml
+#   ansible-playbook coverage_check.yml -e bazel_config=macos_arm64
+#   ansible-playbook coverage_check.yml -e threshold=80
+#   ansible-playbook coverage_check.yml -e keep_report=true
+
+- name: Bazel patch coverage check
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    workspace_dir: "{{ playbook_dir }}/.."
+    bazel_config: ""     # empty = let coverage_check.sh auto-detect
+    threshold: 75
+    keep_report: false
+
+  tasks:
+    - name: Run coverage_check.sh
+      ansible.builtin.command:
+        cmd: >-
+          {{ playbook_dir }}/coverage_check.sh
+          {{ '--config ' + bazel_config if bazel_config | length > 0 else '' }}
+          --threshold {{ threshold }}
+          {{ '--keep-report' if keep_report | bool else '' }}
+        chdir: "{{ workspace_dir }}"
+      register: coverage_result
+      changed_when: false
+      failed_when: false
+
+    - name: Show coverage_check.sh output
+      ansible.builtin.debug:
+        msg: "{{ coverage_result.stdout_lines }}"
+
+    - name: Show coverage_check.sh errors (if any)
+      ansible.builtin.debug:
+        msg: "{{ coverage_result.stderr_lines }}"
+      when: coverage_result.stderr_lines | length > 0
+
+    - name: Fail if patch coverage check failed
+      ansible.builtin.assert:
+        that:
+          - coverage_result.rc == 0
+        fail_msg: "Patch coverage check failed (rc={{ coverage_result.rc }}) — see output above."
+        success_msg: "Patch coverage check passed."

@@ -50,7 +50,7 @@ DEFAULT_PYTHON_VERSION = "3.12"  # CPython release with a prebuilt
                                  # python-build-standalone distribution for
                                  # all four platforms below.
 
-DEFAULT_GO_VERSION = "1.26.5"  # rules_go's go_sdk extension resolves versions
+DEFAULT_GO_VERSION = "0.59.0"  # rules_go's go_sdk extension resolves versions
                                # dynamically against https://go.dev/dl/?mode=json
                                # at fetch time, so the current latest stable
                                # release is always a safe, resolvable pin.
@@ -80,6 +80,9 @@ ASPECT_RULES_LINT_RUST_VERSION = "0.0.2"  # the clippy aspect ships in this
                                           # itself.
 BAZEL_SKYLIB_VERSION = "1.8.2"  # needed for native_binary(), used to expose
                                 # clang-tidy out of the LLVM toolchain download.
+RULES_SHELL_VERSION = "0.6.1"  # needed for sh_binary(), used on macOS to work
+                                # around an aspect_rules_lint clang_tidy bug
+                                # (see clang_tidy_macos_wrapper.sh).
 
 SUPPORTED_LANGUAGES = ["cpp", "java", "python", "go", "rust", "kotlin", "scala", "haskell"]
 
@@ -403,10 +406,24 @@ def render_module_bazel(config: dict) -> str:
     ]
     if any(lang in languages for lang in LINT_ASPECT_NAMES):
         lines.append(f'bazel_dep(name = "aspect_rules_lint", version = "{ASPECT_RULES_LINT_VERSION}")')
+        if "go" not in languages:
+            # aspect_rules_lint -> aspect_rules_js pulls in an old rules_go
+            # (0.42.0 as of aspect_rules_lint 2.7.2) that predates rules_cc's
+            # CcInfo migration, so it fails to load under current Bazel once
+            # MVS resolves rules_cc to a newer version pulled in by some other
+            # dep -- breaking toolchain resolution for every build, Go or not.
+            # Pin a compatible version directly even though this project
+            # doesn't use Go itself.
+            go_dep_version = next(v for n, v in LANGUAGE_BAZEL_DEPS["go"] if n == "rules_go")
+            lines.append(
+                f'bazel_dep(name = "rules_go", version = "{go_dep_version}", repo_name = "io_bazel_rules_go")  '
+                "# transitive pin, see comment above"
+            )
     if "rust" in languages:
         lines.append(f'bazel_dep(name = "aspect_rules_lint_rust", version = "{ASPECT_RULES_LINT_RUST_VERSION}")')
     if "cpp" in languages:
         lines.append(f'bazel_dep(name = "bazel_skylib", version = "{BAZEL_SKYLIB_VERSION}")')
+        lines.append(f'bazel_dep(name = "rules_shell", version = "{RULES_SHELL_VERSION}")')
     for lang in SUPPORTED_LANGUAGES:
         if lang in languages:
             for dep_name, dep_version in LANGUAGE_BAZEL_DEPS[lang]:
@@ -856,8 +873,9 @@ bazel build --config={default_platform} --config=lint //example/java:hello
 ```
 
 Runs checkstyle (downloaded hermetically via `tools/lint/linters.bzl`) and
-fails the build on any violation. Rules live in the workspace root
-`checkstyle.xml`.
+fails the build on any violation. Rules live in `ansible/checkstyle.xml`
+(colocated with the `ansible/lint_affected.yml` playbook that runs this
+check).
 
 ## Files
 
@@ -1585,6 +1603,80 @@ HeaderFilterRegex: '.*'
 """
 
 
+def clang_tidy_macos_wrapper_sh() -> str:
+    return """\
+#!/usr/bin/env bash
+# aspect_rules_lint's clang_tidy aspect strips the compile action's
+# `-cxx-isystem <path>` flag on macOS: its MSVC-flag remapper treats any
+# argument starting with "/" as a Windows-style flag (clang_tidy.bzl's
+# _update_flag), which also matches Unix absolute paths. That drops the
+# libc++ header search path baked into the toolchain's Xcode sysroot, so
+# lint runs fail to find standard headers like <cstdio>. Re-add it via
+# --extra-arg, resolved fresh here so it stays correct across machines and
+# Xcode versions instead of being baked into a checked-in config file.
+set -euo pipefail
+
+# --- begin runfiles.bash initialization v3 ---
+set +u
+if [[ ! -d "${RUNFILES_DIR:-/dev/null}" && ! -f "${RUNFILES_MANIFEST_FILE:-/dev/null}" ]]; then
+  if [[ -f "$0.runfiles_manifest" ]]; then
+    RUNFILES_MANIFEST_FILE="$0.runfiles_manifest"
+  elif [[ -f "$0.runfiles/MANIFEST" ]]; then
+    RUNFILES_MANIFEST_FILE="$0.runfiles/MANIFEST"
+  elif [[ -d "$0.runfiles" ]]; then
+    RUNFILES_DIR="$0.runfiles"
+  fi
+fi
+if [[ -f "${RUNFILES_DIR:-/dev/null}/bazel_tools/tools/bash/runfiles/runfiles.bash" ]]; then
+  source "${RUNFILES_DIR}/bazel_tools/tools/bash/runfiles/runfiles.bash"
+elif [[ -f "${RUNFILES_MANIFEST_FILE:-/dev/null}" ]]; then
+  source "$(grep -sm1 "^bazel_tools/tools/bash/runfiles/runfiles.bash " "${RUNFILES_MANIFEST_FILE}" | cut -d' ' -f2-)"
+else
+  echo >&2 "ERROR: cannot find @bazel_tools//tools/bash/runfiles"
+  exit 1
+fi
+set -u
+# --- end runfiles.bash initialization v3 ---
+
+clang_tidy_bin="$(rlocation llvm_toolchain_llvm/bin/clang-tidy)"
+sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
+# Must precede "$@": clang-tidy's own "--" separator is already inside it,
+# and anything after that separator is forwarded verbatim to the compiler
+# rather than parsed as a clang-tidy option.
+exec "${clang_tidy_bin}" "--extra-arg=-cxx-isystem${sdk_path}/usr/include/c++/v1" "$@"
+"""
+
+
+def ansible_build_bazel() -> str:
+    return """\
+# Exposes lint config files consumed by ansible/lint_affected.yml's
+# `bazel build --config=lint` step (see tools/lint/linters.bzl's Label refs).
+exports_files(["checkstyle.xml"])
+"""
+
+
+# Maps a configured language to the root-level lint config dotfile its
+# tools/lint/linters.bzl aspect references via Label("//:<dotfile>").
+ROOT_LINT_DOTFILES = {
+    "cpp": ".clang-tidy",
+    "python": ".ruff.toml",
+    "rust": ".clippy.toml",
+    "kotlin": ".editorconfig",
+}
+
+
+def root_build_bazel(languages: dict):
+    dotfiles = [ROOT_LINT_DOTFILES[lang] for lang in SUPPORTED_LANGUAGES if lang in languages and lang in ROOT_LINT_DOTFILES]
+    if not dotfiles:
+        return None
+    files = ", ".join(f'"{d}"' for d in dotfiles)
+    return (
+        "# Exposes root-level lint config files consumed by tools/lint/linters.bzl's\n"
+        "# Label refs.\n"
+        f"exports_files([{files}])\n"
+    )
+
+
 def checkstyle_config() -> str:
     return """\
 <?xml version="1.0"?>
@@ -1629,15 +1721,33 @@ insert_final_newline = true
 # Each entry returns (load_line, body) for tools/lint/BUILD.bazel.
 LINT_BUILD_BLOCK_BUILDERS = {
     "cpp": lambda: (
-        'load("@bazel_skylib//rules:native_binary.bzl", "native_binary")',
+        'load("@bazel_skylib//rules:native_binary.bzl", "native_binary")\n'
+        'load("@rules_shell//shell:sh_binary.bzl", "sh_binary")',
         """\
 # Wraps the clang-tidy binary bundled inside the already-downloaded LLVM
 # distribution (see MODULE.bazel's EASY_BUILD:BEGIN/END CPP block) so the
 # clang_tidy lint aspect below can run it -- no separate download needed.
 native_binary(
-    name = "clang_tidy",
+    name = "clang_tidy_bin",
     src = "@llvm_toolchain_llvm//:bin/clang-tidy",
-    out = "clang_tidy",
+    out = "clang_tidy_bin",
+)
+
+# On macOS, works around an aspect_rules_lint bug that drops the toolchain's
+# libc++ header search path (see clang_tidy_macos_wrapper.sh for why).
+sh_binary(
+    name = "clang_tidy_macos_wrapper",
+    srcs = ["clang_tidy_macos_wrapper.sh"],
+    data = ["@llvm_toolchain_llvm//:bin/clang-tidy"],
+    deps = ["@bazel_tools//tools/bash/runfiles"],
+)
+
+alias(
+    name = "clang_tidy",
+    actual = select({
+        "@platforms//os:macos": ":clang_tidy_macos_wrapper",
+        "//conditions:default": ":clang_tidy_bin",
+    }),
     visibility = ["//visibility:public"],
 )
 """,
@@ -1689,7 +1799,7 @@ LINT_LINTERS_BZL_BUILDERS = {
         """\
 clang_tidy = lint_clang_tidy_aspect(
     binary = Label("//tools/lint:clang_tidy"),
-    global_config = Label("//:.clang-tidy"),
+    global_config = [Label("//:.clang-tidy")],
     lint_target_headers = True,
 )
 """,
@@ -1699,7 +1809,7 @@ clang_tidy = lint_clang_tidy_aspect(
         """\
 checkstyle = lint_checkstyle_aspect(
     binary = Label("//tools/lint:checkstyle"),
-    config = Label("//:checkstyle.xml"),
+    config = Label("//ansible:checkstyle.xml"),
 )
 """,
     ),
@@ -1784,8 +1894,9 @@ def cmd_init(args: argparse.Namespace) -> None:
         if not (example_dir / "Hello.java").exists() or args.force:
             write_file(example_dir / "Hello.java", hello_java(), args.force)
         write_file(example_dir / "README.md", readme_java(default_platform, java_version), args.force)
-        if not (out_dir / "checkstyle.xml").exists() or args.force:
-            write_file(out_dir / "checkstyle.xml", checkstyle_config(), args.force)
+        if not (out_dir / "ansible" / "checkstyle.xml").exists() or args.force:
+            write_file(out_dir / "ansible" / "checkstyle.xml", checkstyle_config(), args.force)
+        write_file(out_dir / "ansible" / "BUILD.bazel", ansible_build_bazel(), True)
         config["languages"]["java"] = {
             "version": java_version,
             "platform": default_platform,
@@ -1907,12 +2018,22 @@ def cmd_init(args: argparse.Namespace) -> None:
     write_file(out_dir / ".bazelrc", render_bazelrc(config, default_platform), True)
     write_file(out_dir / "README.md", render_root_readme(config, default_platform), True)
 
+    # Root BUILD.bazel exposes whichever lint config dotfiles the configured
+    # languages need (see ROOT_LINT_DOTFILES); None means none of them do.
+    root_bb = root_build_bazel(config["languages"])
+    if root_bb is not None:
+        write_file(out_dir / "BUILD.bazel", root_bb, True)
+
     # tools/lint/* is likewise composed across every configured language (see
     # LINT_ASPECT_NAMES) and fully regenerated each init; None means no
     # configured language needs it (e.g. a scala- or haskell-only project).
     lint_build_bazel = render_lint_build_bazel(config["languages"])
     if lint_build_bazel is not None:
         write_file(out_dir / "tools" / "lint" / "BUILD.bazel", lint_build_bazel, True)
+    if "cpp" in config["languages"]:
+        wrapper_path = out_dir / "tools" / "lint" / "clang_tidy_macos_wrapper.sh"
+        write_file(wrapper_path, clang_tidy_macos_wrapper_sh(), True)
+        wrapper_path.chmod(wrapper_path.stat().st_mode | 0o111)
     lint_linters_bzl = render_lint_linters_bzl(config["languages"])
     if lint_linters_bzl is not None:
         write_file(out_dir / "tools" / "lint" / "linters.bzl", lint_linters_bzl, True)

@@ -19,7 +19,7 @@ Default target platform for this host: `macos_aarch64`
 `bazel build --config=lint //example/...` runs each configured language's
 hermetic lint aspect and fails on any violation:
 
-- **python** -- `ruff`
+- **cpp** -- `clang_tidy`
 
 ## Files
 
